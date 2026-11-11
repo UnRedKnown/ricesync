@@ -81,3 +81,6 @@ X~/.config/noctalia/colors.json
 X~/.config/niri/noctalia.kdl
 X~/.config/umbriel/noctalia.toml
 X~/.config/plasma-org.kde.plasma.desktop-appletsrc
+
+# ---- changed from dotsync ----
+X~/.config/input-remapper-2/config.json
