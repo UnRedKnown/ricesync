@@ -1,0 +1,81 @@
+# dotsync list — merged from both drafts (2026-11-11)
+# S = sync · D = only show differences · X = leave out
+# ~ = home; a folder means everything in it; * in one folder name matches that
+# folder on each machine (Firefox profiles)
+
+# ---- terminal & shell --------------------------------------------------------
+S~/.config/fish/
+X~/.config/fish/fish_variables
+S~/.config/kitty/
+S~/.config/starship.toml
+S~/.config/fuzzel/
+S~/.config/bat/
+S~/.config/btop/
+S~/.config/fastfetch/
+
+# ---- files & apps ------------------------------------------------------------
+S~/.config/yazi/
+S~/.config/xdg-desktop-portal/
+S~/.config/xdg-desktop-portal-termfilechooser/
+S~/.local/share/applications/yazi.desktop
+S~/.local/share/dbus-1/services/org.freedesktop.FileManager1.service
+S~/.config/mimeapps.list
+S~/.config/xdg-terminals.list
+S~/.config/input-remapper-2/
+S~/.config/kdeconnect/trusted_devices
+
+# ---- look --------------------------------------------------------------------
+S~/.config/gtk-3.0/settings.ini
+S~/.config/gtk-3.0/bookmarks
+S~/.config/gtk-4.0/settings.ini
+S~/.config/qt6ct/qt6ct.conf
+S~/.config/pywalfox/
+
+# ---- desktop (a D line inside an S folder: that file is only compared) ------
+D~/.config/niri/config.kdl
+S~/.config/noctalia/
+D~/.config/noctalia/settings.json
+S~/dev/noctalia-plugins/
+
+# ---- Firefox (each machine's own profile folder) -------------------------------
+S~/.config/mozilla/firefox/*.default-release/chrome/userChrome.css
+S~/.config/mozilla/firefox/*.default-release/chrome/userContent-custom.css
+S~/.config/mozilla/firefox/*.default-release/chrome/JS/
+S~/.config/mozilla/firefox/*.default-release/chrome/utils/
+
+# ---- scripts -----------------------------------------------------------------
+S/usr/local/bin/backup
+S/usr/local/bin/capture
+S/usr/local/bin/default-apps
+S/usr/local/bin/dim
+S/usr/local/bin/dotsync
+S/usr/local/bin/dotsync-draft
+S/usr/local/bin/newtab-wallpaper
+S/usr/local/bin/palette-view
+S/usr/local/bin/peek
+S/usr/local/bin/screen-dimmer
+S/usr/local/bin/setup-check
+S/usr/local/bin/wallpaper-scheme
+S/usr/local/bin/winfo
+S/usr/local/bin/yazi-filechooser
+S/usr/local/bin/yazi-filemanager1
+
+# ---- system ------------------------------------------------------------------
+S/etc/greetd/config.toml
+D/etc/pam.d/greetd
+
+# ---- Noctalia / matugen colours: generated per machine, never sync -------------
+X*/themes/*
+X~/.config/yazi/flavors/
+X~/.config/gtk-3.0/colors.css
+X~/.config/gtk-4.0/colors.css
+X~/.config/gtk-3.0/gtk.css
+X~/.config/gtk-4.0/gtk.css
+X~/.config/gtk-3.0/thunar.css
+X~/.config/gtk-4.0/thunar.css
+X~/.config/gtk-3.0/assets/
+X~/.config/kdeglobals
+X~/.config/noctalia/colors.json
+X~/.config/niri/noctalia.kdl
+X~/.config/umbriel/noctalia.toml
+X~/.config/plasma-org.kde.plasma.desktop-appletsrc
