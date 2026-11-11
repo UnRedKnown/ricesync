@@ -23,7 +23,7 @@ S~/.local/share/dbus-1/services/org.freedesktop.FileManager1.service
 S~/.config/mimeapps.list
 S~/.config/xdg-terminals.list
 S~/.config/input-remapper-2/
-S~/.config/kdeconnect/trusted_devices
+X~/.config/kdeconnect/trusted_devices
 S~/Settings/
 
 # ---- look --------------------------------------------------------------------
