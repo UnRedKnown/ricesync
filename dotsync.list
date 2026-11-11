@@ -12,6 +12,7 @@ S~/.config/fuzzel/
 S~/.config/bat/
 S~/.config/btop/
 S~/.config/fastfetch/
+S~/.config/dotsync/config
 
 # ---- files & apps ------------------------------------------------------------
 S~/.config/yazi/
@@ -23,6 +24,7 @@ S~/.config/mimeapps.list
 S~/.config/xdg-terminals.list
 S~/.config/input-remapper-2/
 S~/.config/kdeconnect/trusted_devices
+S~/Settings/
 
 # ---- look --------------------------------------------------------------------
 S~/.config/gtk-3.0/settings.ini
