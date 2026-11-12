@@ -40,7 +40,8 @@ S~/Pictures/Wallpapers/
 # ---- desktop (a D line inside an S folder: that file is only compared) ------
 D~/.config/niri/config.kdl
 S~/.config/noctalia/
-D~/.config/noctalia/settings.json
+X~/.config/noctalia/settings.json
+D~/.local/state/noctalia/settings.toml
 S~/dev/noctalia-plugins/
 
 # ---- Firefox (each machine's own profile folder) -------------------------------
