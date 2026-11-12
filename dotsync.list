@@ -32,6 +32,7 @@ S~/.config/gtk-3.0/bookmarks
 S~/.config/gtk-4.0/settings.ini
 S~/.config/qt6ct/qt6ct.conf
 S~/.config/pywalfox/
+S~/Pictures/Wallpapers/
 
 # ---- desktop (a D line inside an S folder: that file is only compared) ------
 D~/.config/niri/config.kdl
