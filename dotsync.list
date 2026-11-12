@@ -13,6 +13,9 @@ S~/.config/bat/
 S~/.config/btop/
 S~/.config/fastfetch/
 S~/.config/dotsync/config
+S~/.config/micro/
+X~/.config/micro/colorschemes/
+S~/.config/zed/
 
 # ---- files & apps ------------------------------------------------------------
 S~/.config/yazi/
