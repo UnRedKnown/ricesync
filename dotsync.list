@@ -92,3 +92,5 @@ X~/.config/input-remapper-2/presets/Sleep Button/new preset.json
 X~/.config/input-remapper-2/xmodmap.json
 X~/Settings/Firefox interface.css
 X~/Settings/Firefox pages.css
+X~/Settings/userChrome.css
+X~/Settings/userContent-custom.css
