@@ -23,7 +23,7 @@ S~/.config/xdg-desktop-portal/
 S~/.config/xdg-desktop-portal-termfilechooser/
 S~/.local/share/applications/yazi.desktop
 S~/.local/share/dbus-1/services/org.freedesktop.FileManager1.service
-S~/.config/mimeapps.list
+D~/.config/mimeapps.list
 S~/.config/xdg-terminals.list
 S~/.config/input-remapper-2/
 X~/.config/kdeconnect/trusted_devices
