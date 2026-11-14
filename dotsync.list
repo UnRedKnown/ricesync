@@ -28,6 +28,8 @@ S~/.config/xdg-terminals.list
 S~/.config/input-remapper-2/
 X~/.config/kdeconnect/trusted_devices
 S~/Settings/
+S~/.local/share/applications/ouch-extract.desktop
+S~/.local/share/applications/onlyoffice-desktopeditors.desktop
 
 # ---- look --------------------------------------------------------------------
 S~/.config/gtk-3.0/settings.ini
@@ -66,6 +68,7 @@ S/usr/local/bin/wallpaper-scheme
 S/usr/local/bin/winfo
 S/usr/local/bin/yazi-filechooser
 S/usr/local/bin/yazi-filemanager1
+S/usr/local/bin/unpack
 
 # ---- system ------------------------------------------------------------------
 S/etc/greetd/config.toml
