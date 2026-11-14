@@ -102,3 +102,4 @@ S~/.local/share/fonts/MapleMono/
 X~/.config/micro/backups/
 X~/.config/micro/buffers/
 S~/.config/fontconfig/
+S/usr/local/bin/logout
