@@ -108,3 +108,4 @@ S~/.config/fontconfig/
 S/usr/local/bin/logout
 S/usr/local/bin/sedit
 S~/.config/userscripts/
+X~/.config/fontconfig/fonts.conf.bak
