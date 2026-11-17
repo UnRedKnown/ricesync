@@ -58,7 +58,7 @@ S/usr/local/bin/capture
 S/usr/local/bin/default-apps
 S/usr/local/bin/dim
 S/usr/local/bin/dotsync
-S/usr/local/bin/dotsync-draft
+X/usr/local/bin/dotsync-draft
 S/usr/local/bin/newtab-wallpaper
 S/usr/local/bin/palette-view
 S/usr/local/bin/peek
