@@ -1,0 +1,28 @@
+@import url("noctalia-glass.css");
+@media -moz-pref("user.glass.enabled") {
+body,
+#main-window, #browser, #appcontent, #tabbrowser-tabbox, #tabbrowser-tabpanels,
+.browserContainer, .browserStack, browser[type="content"] {
+   background: transparent !important;
+   background-color: transparent !important;
+}
+:root { --tabpanel-background-color: transparent !important; }
+
+/* Darker glass behind the tab bar and address bar */
+#navigator-toolbox {
+background-color: var(--glass-bar-bg, color-mix(in srgb, var(--toolbarbutton-icon-fill) 18%, color-mix(in srgb, var(--noctalia-glass, rgb(16, 16, 20)) 80%, transparent))) !important;
+}
+/*#navigator-toolbox {
+background-color: color-mix(in srgb, var(--toolbarbutton-icon-fill) 18%, color-mix(in srgb, var(--noctalia-glass, rgb(16, 16, 20)) 80%, transparent)) !important;
+}*/
+
+} /* This is correct, it closes a user.glass.enabled toggle wrapper */
+
+#glass-toggle-button { list-style-image: url("chrome://global/skin/icons/eye.svg"); }
+/* Glass off: nearly solid instead of solid, so Firefox keeps the window
+ *  able to turn see-through again without a resize */
+
+/* Active tab: extra darkness from the "tab" column in wallpaper-schemes.conf */
+.tab-background:is([selected], [multiselected]) {
+   background-image: linear-gradient(rgba(0, 0, 0, var(--glass-tab-dark, 0)), rgba(0, 0, 0, var(--glass-tab-dark, 0))) !important;
+}

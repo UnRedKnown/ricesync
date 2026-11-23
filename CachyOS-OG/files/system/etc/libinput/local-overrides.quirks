@@ -1,0 +1,4 @@
+[Logitech M650 L Side Buttons]
+MatchUdevType=mouse
+MatchName=Logitech Signature M650 L
+AttrEventCode=-REL_HWHEEL;-REL_HWHEEL_HI_RES;

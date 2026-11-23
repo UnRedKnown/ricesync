@@ -1,0 +1,10 @@
+[Unit]
+Description=Bring up enp4s0 for Wake-on-LAN
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ip link set enp4s0 up
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# backup - rotating, permanent manual snapper snapshots
+#
+#   backup              create a snapshot, delete the oldest if over MAX_BACKUPS
+#   backup -l           list manual snapshots with their exclusive size
+#   backup -d N         delete manual snapshot N
+#   backup -r N         restore manual snapshot N (via btrfs-assistant)
+#   backup --check      size check, writes warnings to /run/backup-warning (run at boot)
+#   backup --notify     show the boot warning, if any (run at login)
+#   backup --install    install to /usr/local/bin, create config + boot/login hooks
+#
+# Snapshots are created with no snapper cleanup algorithm, so snapper never
+# prunes them. They are tagged with userdata "manual=yes"; this script only
+# ever touches snapshots carrying that tag.
+
+set -euo pipefail
+
+ARGS=("$@")
+CONF=/etc/backup.conf
+WARN_FILE=/run/backup-warning
+
+# Defaults, overridden by /etc/backup.conf
+SNAPPER_CONFIG=root
+MAX_BACKUPS=3
+NAME_FORMAT='manual %Y-%m-%d %H:%M'   # passed to date(1); avoid commas
+WARN_SIZE_GB=8                        # warn when a snapshot's stale data exceeds this
+
+# shellcheck disable=SC1090
+[[ -r $CONF ]] && source "$CONF"
+
+die() { echo "backup: $*" >&2; exit 1; }
+
+need_root() {
+    [[ $EUID -eq 0 ]] || exec sudo -- "$(realpath "$0")" "${ARGS[@]}"
+}
+
+# Numbers of all manual snapshots, oldest first
+manual_numbers() {
+    snapper --csvout -c "$SNAPPER_CONFIG" list --columns number,userdata |
+        awk -F, '/manual=yes/ {print $1}' | sort -n
+}
+
+is_manual() {
+    manual_numbers | grep -qx -- "$1"
+}
+
+description_of() {
+    snapper --csvout -c "$SNAPPER_CONFIG" list --columns number,description |
+        awk -F, -v n="$1" '$1 == n {print $2}'
+}
+
+date_of() {
+    snapper --csvout -c "$SNAPPER_CONFIG" list --columns number,date |
+        awk -F, -v n="$1" '$1 == n {print $2}'
+}
+
+snap_path() {
+    local subvol
+    # shellcheck disable=SC1090
+    subvol=$(source "/etc/snapper/configs/$SNAPPER_CONFIG"; echo "$SUBVOLUME")
+    echo "${subvol%/}/.snapshots/$1/snapshot"
+}
+
+# Bytes that deleting this snapshot would free right now
+exclusive_bytes() {
+    btrfs filesystem du -s --raw "$(snap_path "$1")" | awk 'NR == 2 {print $2}'
+}
+
+# Approximate bytes of old data this snapshot keeps that the live system no
+# longer uses: the files that were changed or deleted since it was taken.
+# Counts uncompressed file sizes, so it is an upper estimate.
+stale_bytes() {
+    local base
+    base=$(snap_path "$1")
+    snapper -c "$SNAPPER_CONFIG" status "$1..0" |
+        awk -v base="$base" '/^[-ct]/ { sub(/^[^ ]+ /, ""); printf "%s%s%c", base, $0, 0 }' |
+        { xargs -0 -r stat -c '%b %B %F' 2>/dev/null || true; } |
+        awk '$3 == "regular" { sum += $1 * $2 } END { printf "%d\n", sum }'
+}
+
+human() { numfmt --to=iec --suffix=B "$1"; }
+
+cmd_create() {
+    need_root
+    local name num nums
+    name=$(date +"$NAME_FORMAT")
+    num=$(snapper -c "$SNAPPER_CONFIG" create --type single \
+            --description "$name" --userdata manual=yes --print-number)
+    echo "Created snapshot #$num ($name)"
+
+    mapfile -t nums < <(manual_numbers)
+    while (( ${#nums[@]} > MAX_BACKUPS )); do
+        echo "Over the limit of $MAX_BACKUPS, deleting oldest: #${nums[0]} ($(description_of "${nums[0]}"))"
+        snapper -c "$SNAPPER_CONFIG" delete "${nums[0]}"
+        nums=("${nums[@]:1}")
+    done
+}
+
+cmd_list() {
+    need_root
+    local nums n
+    mapfile -t nums < <(manual_numbers)
+    (( ${#nums[@]} )) || { echo "No manual snapshots yet. Run 'backup' to create one."; return; }
+    echo "Manual snapshots (${#nums[@]}/$MAX_BACKUPS), calculating sizes..."
+    printf '%-6s %-21s %-10s %-10s %s\n' "NUM" "DATE" "STALE" "EXCLUSIVE" "NAME"
+    for n in "${nums[@]}"; do
+        printf '%-6s %-21s %-10s %-10s %s\n' "$n" "$(date_of "$n")" \
+            "$(human "$(stale_bytes "$n")")" \
+            "$(human "$(exclusive_bytes "$n")")" "$(description_of "$n")"
+    done
+    echo
+    echo "STALE:     old data the live system no longer uses (approximate, uncompressed)"
+    echo "EXCLUSIVE: space freed right now by deleting only this snapshot"
+}
+
+cmd_delete() {
+    need_root
+    local n=${1:-}
+    [[ $n =~ ^[0-9]+$ ]] || die "usage: backup -d NUMBER"
+    is_manual "$n" || die "#$n is not a manual snapshot (see 'backup -l')"
+    snapper -c "$SNAPPER_CONFIG" delete "$n"
+    echo "Deleted snapshot #$n"
+}
+
+cmd_restore() {
+    need_root
+    local n=${1:-} line idx answer
+    [[ $n =~ ^[0-9]+$ ]] || die "usage: backup -r NUMBER"
+    is_manual "$n" || die "#$n is not a manual snapshot (see 'backup -l')"
+    command -v btrfs-assistant >/dev/null || die "btrfs-assistant is not installed"
+
+    # btrfs-assistant uses its own index, so find the row for this snapshot
+    line=$(btrfs-assistant -l 2>/dev/null | grep -F ".snapshots/$n/snapshot" | head -n1 || true)
+    idx=$(awk '{print $1}' <<<"$line")
+    if [[ ! $idx =~ ^[0-9]+$ ]]; then
+        echo "Could not find snapshot #$n in 'btrfs-assistant -l' output." >&2
+        echo "Run 'sudo btrfs-assistant -l', find the row for .snapshots/$n/snapshot," >&2
+        echo "then run 'sudo btrfs-assistant -r INDEX'." >&2
+        exit 1
+    fi
+
+    echo "About to restore: $line"
+    echo "The current root will be kept as a backup subvolume by btrfs-assistant."
+    read -rp "Restore snapshot #$n ($(description_of "$n"))? [y/N] " answer
+    [[ $answer == [yY] ]] || die "aborted"
+    btrfs-assistant -r "$idx"
+    echo "Done. Reboot to start using the restored root."
+}
+
+cmd_check() {
+    need_root
+    local limit=$(( WARN_SIZE_GB * 1024 * 1024 * 1024 )) msg="" n bytes
+    while read -r n; do
+        [[ -n $n ]] || continue
+        bytes=$(stale_bytes "$n")
+        if (( bytes > limit )); then
+            msg+="Snapshot #$n is larger than ${WARN_SIZE_GB}GiB ($(human "$bytes")). "$'\n'
+        fi
+    done < <(manual_numbers)
+    printf '%s' "$msg" > "$WARN_FILE"
+    chmod 644 "$WARN_FILE"
+    if [[ -n $msg ]]; then printf '%s' "$msg"; else echo "All manual snapshots are within ${WARN_SIZE_GB}GiB."; fi
+}
+
+cmd_notify() {
+    # Wait for the boot-time check to finish (it may still be measuring)
+    local i
+    for (( i = 0; i < 120; i++ )); do
+        [[ -e $WARN_FILE ]] && break
+        sleep 1
+    done
+    [[ -s $WARN_FILE ]] || return 0
+    if command -v notify-send >/dev/null; then
+        local action
+        action=$(notify-send -u normal -a backup -A new="Create backup" \
+        "Snapshots exceed max size" "$(cat "$WARN_FILE")" || true)
+        if [[ $action == new ]]; then
+            if pkexec /usr/local/bin/backup; then
+                notify-send "Backup created"
+            else
+                notify-send -u critical -a backup "Backup was not created"
+            fi
+        fi
+    else
+        cat "$WARN_FILE"
+    fi
+}
+
+cmd_install() {
+    need_root
+    install -m 755 "$(realpath "$0")" /usr/local/bin/backup
+
+    if [[ ! -e $CONF ]]; then
+        cat > "$CONF" <<'EOF'
+# Settings for /usr/local/bin/backup
+
+# Snapper config to snapshot (see: snapper list-configs)
+SNAPPER_CONFIG=root
+
+# How many manual snapshots to keep; the oldest is deleted when exceeded
+MAX_BACKUPS=3
+
+# Snapshot name, in date(1) format. Avoid commas.
+NAME_FORMAT='manual %Y-%m-%d %H:%M'
+
+# Warn at startup when a snapshot's exclusive data exceeds this many GiB
+WARN_SIZE_GB=8
+EOF
+        echo "Wrote $CONF"
+    fi
+
+    cat > /etc/systemd/system/backup-check.service <<'EOF'
+[Unit]
+Description=Check the size of manual backup snapshots
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/backup --check
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    mkdir -p /etc/xdg/autostart
+    cat > /etc/xdg/autostart/backup-notify.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Backup snapshot size warning
+Exec=/usr/local/bin/backup --notify
+NoDisplay=true
+EOF
+
+    systemctl daemon-reload
+    systemctl enable backup-check.service
+    echo "Installed. Edit $CONF, then run 'backup'."
+}
+
+case ${1:-} in
+    "")              cmd_create ;;
+    -l|--list)       cmd_list ;;
+    -d|--delete)     cmd_delete "${2:-}" ;;
+    -r|--restore)    cmd_restore "${2:-}" ;;
+    --check)         cmd_check ;;
+    --notify)        cmd_notify ;;
+    --install)       cmd_install ;;
+    -h|--help)       sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *)               die "unknown option '$1' (try 'backup --help')" ;;
+esac

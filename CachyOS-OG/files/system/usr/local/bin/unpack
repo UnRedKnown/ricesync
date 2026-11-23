@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# unpack - extract archives next to themselves with ouch (the default app for
+# archives, through ouch-extract.desktop). A folder is made for archives with
+# more than one thing at the top, so nothing spills out.
+# Runs in a small kitty window: it closes by itself when all went fine, and
+# stays open (Enter closes it) when ouch had a question or something failed.
+
+command -v ouch >/dev/null || { echo "unpack: needs ouch"; read -r -p "Enter closes this window" _; exit 1; }
+[ $# -gt 0 ] || { echo "usage: unpack ARCHIVE..."; exit 2; }
+
+failed=0
+for a in "$@"; do
+    dir=$(dirname -- "$(realpath -- "$a")")
+    echo "Extracting $(basename -- "$a") …"
+    if ouch decompress --dir "$dir" -- "$a"; then
+        command -v notify-send >/dev/null && notify-send -a unpack "Extracted" "$(basename -- "$a")"
+    else
+        failed=1
+    fi
+done
+if (( failed )); then
+    echo; read -r -p "Something went wrong (see above). Enter closes this window" _
+fi

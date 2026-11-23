@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# winfo - browse every niri window and see its details
+#
+#   winfo          list all windows (fuzzel), pick one to see details
+#
+# In the details view, pick a line to copy its value, or pick an action:
+# focus the window, close it, or copy a ready-made window-rule.
+#
+# Needs: niri, jq, fuzzel, wl-clipboard, libnotify
+
+set -uo pipefail
+
+notify() { notify-send -a winfo -t 2500 "$@"; }
+menu()   { fuzzel --dmenu --index --layer overlay "$@"; }
+
+windows=$(niri msg --json windows)       || { notify "niri not reachable"; exit 1; }
+workspaces=$(niri msg --json workspaces) || exit 1
+
+# Attach workspace info to each window and sort by monitor, workspace,
+# then position in the scrolling layout (floating windows last).
+data=$(jq -c --argjson ws "$workspaces" '
+    ($ws | map({key: (.id | tostring), value: .}) | from_entries) as $w
+    | map(. + {ws: ($w[(.workspace_id | tostring)] // {})})
+    | sort_by(
+        (.ws.output // "~"),
+        (.ws.idx // 999),
+        (if .is_floating then 1 else 0 end),
+        (.layout.pos_in_scrolling_layout[0] // 999),
+        (.layout.pos_in_scrolling_layout[1] // 999)
+      )
+' <<<"$windows")
+
+count=$(jq length <<<"$data")
+(( count > 0 )) || { notify "No windows open"; exit 0; }
+
+# --- window list --------------------------------------------------------------
+list=$(jq -r '.[] |
+    (if .is_focused then "● " else "   " end)
+    + (.app_id // "unknown")
+    + "  —  "
+    + ((.title // "") | if length > 60 then .[0:57] + "…" else . end)
+    + "      ["
+    + (.ws.output // "?")
+    + " · ws "
+    + ((.ws.name // (.ws.idx // "?")) | tostring)
+    + (if .is_floating then " · floating" else "" end)
+    + (if .is_urgent then " · urgent" else "" end)
+    + "]"
+' <<<"$data")
+
+lines=$(( count < 15 ? count : 15 ))
+idx=$(menu --prompt "Windows ($count): " --width 110 --lines "$lines" <<<"$list") || exit 0
+win=$(jq -c ".[$idx]" <<<"$data")
+
+# --- gather details -----------------------------------------------------------
+get() { jq -r "$1 // empty" <<<"$win"; }
+
+id=$(get .id)
+app_id=$(get .app_id)
+title=$(get .title)
+pid=$(get .pid)
+output=$(get .ws.output)
+ws_idx=$(get .ws.idx)
+ws_name=$(get .ws.name)
+floating=$(get .is_floating)
+focused=$(get .is_focused)
+urgent=$(get .is_urgent)
+col=$(get '.layout.pos_in_scrolling_layout[0]')
+row=$(get '.layout.pos_in_scrolling_layout[1]')
+size=$(jq -r '.layout.window_size // empty | "\(.[0]) × \(.[1])"' <<<"$win")
+
+proc=""; cmd=""; backend="Wayland (native)"
+if [[ -n $pid && -r /proc/$pid/comm ]]; then
+    proc=$(< "/proc/$pid/comm")
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+    cmd=${cmd% }
+    # X11 apps are shown to niri through xwayland-satellite,
+    # so the window's process is the satellite, not the app itself
+    [[ $proc == xwayland-satel* ]] && backend="X11 (via xwayland-satellite)"
+fi
+
+if [[ $floating == true ]]; then
+    layout="Floating"
+elif [[ -n $col ]]; then
+    layout="Tiled, column $col, row $row"
+else
+    layout="Tiled"
+fi
+
+workspace="${ws_idx:-?}"
+[[ -n $ws_name ]] && workspace+=" ($ws_name)"
+
+state=()
+[[ $focused == true ]] && state+=("focused")
+[[ $urgent  == true ]] && state+=("urgent")
+state_str=$(IFS=', '; echo "${state[*]:-—}")
+
+# Regex-escape the app id for a window-rule match
+rule_app=$(sed 's/[][\.^$*+?(){}|]/\\&/g' <<<"$app_id")
+rule=$(printf 'window-rule {\n    match app-id=r#"^%s$"#\n    \n}\n' "$rule_app")
+
+# --- details view -------------------------------------------------------------
+# Each entry: "Label|value-to-copy". Values starting with @ are actions.
+entries=(
+    "Title|$title"
+    "App ID|$app_id"
+    "Window ID|$id"
+    "Backend|$backend"
+    "Process|${proc:-?} (PID ${pid:-?})"
+    "Command|${cmd:-?}"
+    "Monitor|${output:-?}"
+    "Workspace|$workspace"
+    "Layout|$layout"
+    "Size|${size:-?}"
+    "State|$state_str"
+    "──────────|@none"
+    "→ Focus this window|@focus"
+    "→ Copy window-rule for this app|@rule"
+    "→ Close this window|@close"
+)
+
+shown=""
+for e in "${entries[@]}"; do
+    label=${e%%|*}
+    value=${e#*|}
+    if [[ $value == @* ]]; then
+        shown+="$label"$'\n'
+    else
+        shown+=$(printf '%-11s %s' "$label" "$value")$'\n'
+    fi
+done
+
+pick=$(menu --prompt "${app_id:-window}: " --width 110 --lines "${#entries[@]}" \
+       <<<"${shown%$'\n'}") || exit 0
+
+value=${entries[$pick]#*|}
+label=${entries[$pick]%%|*}
+
+case $value in
+    @focus) niri msg action focus-window --id "$id" ;;
+    @close) niri msg action close-window --id "$id" ;;
+    @rule)  printf '%s' "$rule" | wl-copy
+            notify "Window rule copied" "match app-id=r#\"^$rule_app\$\"#" ;;
+    @none)  ;;
+    *)      printf '%s' "$value" | wl-copy
+            notify "$label copied" "$value" ;;
+esac

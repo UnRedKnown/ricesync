@@ -1,0 +1,24 @@
+[terminal]
+# The VT to run the greeter on. Can be "next", "current" or a number
+# designating the VT.
+vt = 1
+
+[default_session]
+command = "/usr/bin/noctalia-greeter-session"
+user = "greeter"
+
+[session]
+default = "Niri"
+
+[user]
+default = "@USER@"
+
+[output]
+name = "eDP-1"
+
+[idle]
+timeout = 30
+
+[keyboard]
+layout = "pl"
+

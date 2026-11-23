@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""k10 - backlight color of a Keychron QMK keyboard (K10 V2 etc.) over USB
+
+  k10                  show the keyboard and its current lighting (changes nothing)
+  k10 #ff8800          set the color
+  k10 255 136 0        set the color from R G B (e.g. k10 (matcolor source_color))
+  k10 40%              set the brightness
+  k10 ... --no-save    change it only until the keyboard is unplugged
+
+Works with the cable plugged in (the keyboard only offers this over USB).
+Uses the same protocol as VIA / Keychron Launcher, so it changes the same
+setting you'd change there: one color (hue + saturation) for the whole board.
+"""
+import colorsys
+import glob
+import os
+import select
+import sys
+
+VENDOR = 0x3434                        # Keychron
+RAW_HID_SIG = bytes.fromhex("0660ff0961")  # usage page 0xFF60, usage 0x61 (QMK raw HID)
+
+GET_PROTOCOL, SET_VALUE, GET_VALUE, SAVE = 0x01, 0x07, 0x08, 0x09
+RGB_MATRIX = 3
+BRIGHTNESS, EFFECT, SPEED, COLOR = 1, 2, 3, 4
+
+
+def die(msg):
+    print(f"k10: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def find_device():
+    found_vendor = False
+    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(f"{node}/device/uevent") as f:
+                uevent = f.read()
+            hid_id = next(l.split("=", 1)[1] for l in uevent.splitlines() if l.startswith("HID_ID="))
+            _bus, vid, pid = (int(x, 16) for x in hid_id.split(":"))
+            if vid != VENDOR:
+                continue
+            found_vendor = True
+            with open(f"{node}/device/report_descriptor", "rb") as f:
+                if RAW_HID_SIG not in f.read():
+                    continue
+            name = next((l.split("=", 1)[1] for l in uevent.splitlines() if l.startswith("HID_NAME=")), "?")
+            return "/dev/" + os.path.basename(node), name, pid
+        except (OSError, StopIteration, ValueError):
+            continue
+    if found_vendor:
+        die("found a Keychron device but not its settings interface (is the cable plugged in, not Bluetooth?)")
+    die("no Keychron keyboard found over USB (plug in the cable and switch it to wired mode)")
+
+
+class Board:
+    def __init__(self, path):
+        try:
+            self.fd = os.open(path, os.O_RDWR)
+        except PermissionError:
+            die(f"no permission for {path} - add the udev rule (see the instructions)")
+
+    def cmd(self, *data):
+        pkt = bytes(data) + bytes(32 - len(data))
+        os.write(self.fd, b"\x00" + pkt)        # report ID 0 + 32 bytes
+        while True:
+            r, _, _ = select.select([self.fd], [], [], 1.0)
+            if not r:
+                die("keyboard didn't answer")
+            resp = os.read(self.fd, 32)
+            if resp[:1] == bytes([0xFF]):
+                die(f"keyboard doesn't support command 0x{data[0]:02x}")
+            if resp[0] == data[0]:
+                return resp
+
+    def get(self, value_id, n):
+        return list(self.cmd(GET_VALUE, RGB_MATRIX, value_id)[3:3 + n])
+
+    def set(self, value_id, *vals):
+        self.cmd(SET_VALUE, RGB_MATRIX, value_id, *vals)
+
+
+def parse_color(args):
+    if len(args) == 1 and args[0].lstrip("#") and len(args[0].lstrip("#")) == 6:
+        h = args[0].lstrip("#")
+        try:
+            return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+        except ValueError:
+            pass
+    if len(args) == 3 and all(a.isdigit() and int(a) <= 255 for a in args):
+        return tuple(int(a) for a in args)
+    return None
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a != "--no-save"]
+    save = "--no-save" not in sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+
+    path, name, pid = find_device()
+    kb = Board(path)
+    ver = kb.cmd(GET_PROTOCOL)
+    hue, sat = kb.get(COLOR, 2)
+    bri, = kb.get(BRIGHTNESS, 1)
+
+    if not args:
+        effect, = kb.get(EFFECT, 1)
+        r, g, b = (round(c * 255) for c in colorsys.hsv_to_rgb(hue / 255, sat / 255, 1))
+        print(f"{name}  ({path}, product {pid:04x}, protocol {ver[1] << 8 | ver[2]})")
+        print(f"color       #{r:02x}{g:02x}{b:02x}  (hue {hue}, saturation {sat})")
+        print(f"brightness  {round(bri * 100 / 255)}%")
+        print(f"effect      {effect}" + ("  (solid color)" if effect == 1 else "  (not solid - the color may be mixed in or ignored)"))
+        return
+
+    changed = False
+    if len(args) == 1 and args[0].endswith("%") and args[0][:-1].isdigit():
+        new = min(255, round(int(args[0][:-1]) * 255 / 100))
+        if new != bri:
+            kb.set(BRIGHTNESS, new)
+            changed = True
+        msg = f"brightness {args[0]}"
+    else:
+        rgb = parse_color(args)
+        if rgb is None:
+            die("usage: k10 [#RRGGBB | R G B | N%] [--no-save]")
+        h, s, _v = colorsys.rgb_to_hsv(*(c / 255 for c in rgb))
+        nh, ns = round(h * 255) % 256, round(s * 255)
+        if (nh, ns) != (hue, sat):
+            kb.set(COLOR, nh, ns)
+            changed = True
+        msg = "color #%02x%02x%02x (hue %d, saturation %d)" % (*rgb, nh, ns)
+
+    if changed and save:
+        kb.cmd(SAVE, RGB_MATRIX)
+    print(f"k10: {msg}" + ("" if changed else " (already set)") + ("" if save or not changed else ", not saved"))
+
+
+if __name__ == "__main__":
+    main()

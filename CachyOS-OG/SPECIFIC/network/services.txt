@@ -1,0 +1,10 @@
+# unit [system|user]   — enabled by: ./install.sh --specific network
+libvirtd.service
+libvirtd.socket
+virtlogd.service
+sshd.service
+tailscaled.service
+smb.service
+nmb.service
+wol.service
+enp4s0-up.service

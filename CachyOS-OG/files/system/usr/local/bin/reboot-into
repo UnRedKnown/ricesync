@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# reboot-into - make Limine boot a given entry, then reboot
+#
+#   reboot-into "Arch Linux"
+#   reboot-into "CachyOS/linux-cachyos"
+#   reboot-into -n "Arch Linux"     set it, but don't reboot (to check first)
+#
+# Sets the entry Limine remembers as "last booted" (remember_last_entry: yes
+# in limine.conf), so Limine picks it at the next boot, and keeps picking it
+# until something else is booted. Reads the variable back before rebooting;
+# if anything doesn't check out, it stops without rebooting.
+set -euo pipefail
+
+# Limine 12.9.5+ keeps the entry under this GUID. (Older versions used
+# 513ee0d0-6e43-cb05-b272-f146a2fcb88a, which current Limine ignores.)
+VAR=/sys/firmware/efi/efivars/LimineLastBootedEntry-03884334-1756-4978-9c8c-86fb8998b4ea
+# Attributes Limine itself uses: non-volatile + boot service + runtime access
+ATTRS='\x07\x00\x00\x00'
+
+if [[ $EUID -ne 0 ]]; then
+    exec sudo "$0" "$@"
+fi
+
+do_reboot=1
+if [[ ${1-} == -n ]]; then do_reboot=0; shift; fi
+entry="${1:?Usage: reboot-into [-n] <entry, e.g. \"Arch Linux\" or CachyOS/linux-cachyos>}"
+
+die() { echo "reboot-into: $*" >&2; exit 1; }
+
+# The value as it really is. (Read through a pipe: efivarfs can report a stale
+# file size, and tools that trust the size then read too little.)
+current() { cat -- "$VAR" 2>/dev/null | tail -c +5; }
+
+[[ -d /sys/firmware/efi/efivars ]] || die "not booted in UEFI mode"
+[[ -e $VAR ]] || echo "reboot-into: note: $VAR doesn't exist yet (Limine creates it at boot); creating it" >&2
+
+# Is there such an entry in limine.conf? (Its last part, e.g. "linux-cachyos")
+conf=""
+for f in /boot/limine.conf /boot/limine/limine.conf /boot/EFI/limine/limine.conf /efi/limine.conf; do
+    [[ -r $f ]] && { conf=$f; break; }
+done
+if [[ -n $conf ]]; then
+    name=${entry##*/}
+    grep -qxF -- "$name" < <(sed -nE 's/^[[:space:]]*\/+[+]?(.*[^[:space:]])[[:space:]]*$/\1/p' "$conf") \
+        || die "no entry named '$name' in $conf"
+fi
+
+# Same format Limine writes: the entry path, then a zero byte
+tmp=$(mktemp)
+trap 'rm -f "$tmp" "$tmp.want"' EXIT
+printf '%s\0' "$entry" > "$tmp.want"
+{ printf "$ATTRS"; cat "$tmp.want"; } > "$tmp"
+
+old=$(current | tr '\0' '\n' | head -n 1)
+
+# Replace: delete the old variable, then create it fresh with the new value
+if [[ -e $VAR ]]; then
+    chattr -i "$VAR" 2>/dev/null || true
+    rm -f -- "$VAR"
+fi
+cat "$tmp" > "$VAR" || die "couldn't write the new value (the old one, '$old', was removed; Limine will use its default entry)"
+
+# Read it back
+current | cmp -s - "$tmp.want" \
+    || die "the variable doesn't hold exactly what was written; not rebooting. Check: sudo hexdump -C $VAR"
+
+echo "Next boot: $entry   (was: ${old:-nothing})"
+(( do_reboot )) && systemctl reboot
+exit 0

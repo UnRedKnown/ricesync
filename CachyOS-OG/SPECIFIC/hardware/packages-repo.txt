@@ -1,0 +1,6 @@
+cuda
+intel-lpmd
+lib32-nvidia-utils
+nvidia-settings
+nvidia-utils
+opencl-nvidia

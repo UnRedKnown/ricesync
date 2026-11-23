@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""glass - one see-through level for every window's background
+
+  glass          show each app's current background opacity (changes nothing)
+  glass 0.75     set them all to 0.75 (0 = fully clear, 1 = solid)
+
+Only the base background of each window is changed; layers drawn on top
+(Firefox's sidebars and site panels, Cartridges' cards, GTK sidebars) keep
+their own values. Every file is backed up before it's changed, to
+~/.local/state/glass/ (one folder per run). A file whose layout doesn't
+look as expected is left alone and reported.
+
+What happens when:
+  kitty       right away, in every open window (needs dynamic_background_opacity)
+  Noctalia    right away (its bar)
+  fuzzel      next time it opens
+  Zed         right away (it reloads its theme file)
+  GTK4 apps   next time each app starts (Cartridges, file picker, ...)
+  Firefox     next time Firefox starts
+Nothing is closed or restarted by this script.
+"""
+import glob, os, re, shutil, signal, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+STATE = os.path.join(HOME, ".local/state/glass")
+
+def p(*a): return os.path.join(HOME, *a)
+
+def one_firefox_chrome():
+    found = [d for d in glob.glob(p(".config/mozilla/firefox/*/chrome"))
+             + glob.glob(p(".mozilla/firefox/*/chrome")) if os.path.isfile(os.path.join(d, "userChrome.css"))]
+    return found[0] if len(found) == 1 else None
+
+ff = one_firefox_chrome()
+
+# (only keys at the theme's own level, indented 8 spaces: "background" also
+# appears deeper down, in the per-cursor "players" colours, which aren't
+# window backgrounds)
+FF_MIX = r"color-mix\(in srgb,\s*var\(--noctalia-glass,\s*rgb\(16,\s*16,\s*20\)\)\s*"
+
+ZED_KEYS = (r'(?m)(^ {8}"(?:background|status_bar\.background|title_bar\.background|'
+            r'title_bar\.inactive_background|tab\.inactive_background|tab\.active_background)":')
+
+# Each target: name, file, regex whose group 2 is the number, how many
+# matches are expected (None = at least one), and the number's format.
+#   "dec": 0.75   "hex": two hex digits (bf)   "pct": 75 (a %)
+TARGETS = [
+    ("kitty", p(".config/kitty/kitty.conf"),
+     r"(?m)^(background_opacity[ \t]+)([0-9.]+)", 1, "dec"),
+    ("Noctalia bar", p(".local/state/noctalia/settings.toml"),
+     r"(?s)(\[bar\.default\][^\[]*?background_opacity[ \t]*=[ \t]*)([0-9.]+)", 1, "dec"),
+    ("fuzzel (template)", p(".config/noctalia/templates/fuzzel.ini"),
+     r"(?m)^(background=\{\{[^}]*\}\})([0-9a-fA-F]{2})$", 1, "hex"),
+    ("fuzzel (current)", p(".config/fuzzel/themes/noctalia-custom"),
+     r"(?m)^(background=[0-9a-fA-F]{6})([0-9a-fA-F]{2})$", 1, "hex"),
+    # Zed: only the Transparent themes' base backgrounds (window, title bar,
+    # status bar, tabs); the opaque themes have no alpha there to match
+    ("Zed (template)", p(".config/noctalia/templates/zed.json"),
+     ZED_KEYS + r'\s*"\{\{[^}]*\}\})([0-9A-Fa-f]{2})(?=")', 12, "hex"),
+    ("Zed (current)", p(".config/zed/themes/noctalia.json"),
+     ZED_KEYS + r'\s*"#[0-9A-Fa-f]{6})([0-9A-Fa-f]{2})(?=")', 12, "hex"),
+    ("GTK4 apps", p(".config/gtk-4.0/custom.css"),
+     r"(window\.background\s*\{\s*background-color:\s*alpha\(@(?:noctalia_glass|window_bg_color),\s*)([0-9.]+)", 1, "dec"),
+]
+if ff:
+    TARGETS += [
+        # Noctalia's colour (--noctalia-glass) mixed with clear: the % is the opacity
+        ("Firefox pages", os.path.join(ff, "userContent-custom.css"),
+         r"(html\s*\{\s*background-color:\s*" + FF_MIX + r")(\d+)(?=%)", None, "pct"),
+        ("Firefox toolbars", os.path.join(ff, "userChrome.css"),
+         r"(" + FF_MIX + r")(\d+)(?=%)", None, "pct"),
+    ]
+
+def to_float(v, fmt):
+    if fmt == "hex": return int(v, 16) / 255
+    if fmt == "pct": return int(v) / 100
+    return float(v)
+
+def from_float(x, fmt):
+    if fmt == "hex": return format(round(x * 255), "02x")
+    if fmt == "pct": return str(round(x * 100))
+    return f"{x:.2f}".rstrip("0").rstrip(".") if x not in (0, 1) else str(int(x))
+
+def read(t):
+    name, path, rx, n, fmt = t
+    if not os.path.isfile(path): return None, "file not found"
+    m = re.findall(rx, open(path, encoding="utf-8").read())
+    if not m: return None, "setting not found"
+    if n is not None and len(m) != n: return None, f"found {len(m)} times, expected {n}"
+    vals = sorted({round(to_float(v, fmt), 2) for _, v in m})
+    return vals, None
+
+def show():
+    if not ff: print("(Firefox: no single profile with a chrome/userChrome.css found, skipped)")
+    w = max(len(t[0]) for t in TARGETS)
+    for t in TARGETS:
+        vals, err = read(t)
+        shown = ", ".join(f"{v:g}" for v in vals) if vals else f"- ({err})"
+        print(f"  {t[0]:<{w}}  {shown}")
+    print("\nSet them all with: glass 0.75")
+
+def apply(x):
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = os.path.join(STATE, stamp)
+    changed, skipped = [], []
+    for t in TARGETS:
+        name, path, rx, n, fmt = t
+        vals, err = read(t)
+        if err:
+            skipped.append(f"{name}: {err}"); continue
+        text = open(path, encoding="utf-8").read()
+        new = re.sub(rx, lambda m: m.group(1) + from_float(x, fmt), text)
+        if new == text:
+            continue
+        os.makedirs(backup, exist_ok=True)
+        dest = os.path.join(backup, path.replace(HOME + "/", "").replace("/", "__"))
+        if not os.path.exists(dest):          # (keep the oldest copy of this run)
+            shutil.copy2(path, dest)
+        with open(path, "w", encoding="utf-8") as f:   # (same file: keeps its owner and mode)
+            f.write(new)
+        changed.append(name)
+
+    # kitty: reload the config in every open kitty (windows stay open)
+    if "kitty" in changed and subprocess.run(["pgrep", "-x", "kitty"], capture_output=True).returncode == 0:
+        subprocess.run(["pkill", "-USR1", "-x", "kitty"])
+
+    print(f"Set to {x:g}: " + (", ".join(changed) if changed else "nothing needed changing"))
+    for s in skipped: print("  skipped " + s)
+    if changed:
+        print(f"Backups: {backup}")
+        later = [n for n in changed if n.startswith(("GTK", "Firefox"))]
+        if later:
+            print("Takes effect when each starts again: " + ", ".join(later))
+
+def main():
+    a = sys.argv[1:]
+    if not a: return show()
+    if a[0] in ("-h", "--help"): return print(__doc__.strip())
+    try:
+        x = float(a[0].replace(",", "."))
+    except ValueError:
+        sys.exit("glass: give a number from 0 to 1, e.g. glass 0.75")
+    if not 0 <= x <= 1: sys.exit("glass: the value must be from 0 (clear) to 1 (solid)")
+    apply(x)
+
+main()

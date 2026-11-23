@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# sedit - open files in your editor, also from root yazi
+#
+#   sedit FILE...         in $EDITOR (micro), in this terminal
+#   sedit --gui FILE...   in Zed
+#
+# As yourself: just opens the files, nothing else (no sudo, no password).
+# As root through sudo (Super+Shift+E yazi): the editor still runs as YOU,
+# with your settings. sedit copies each file to a temp file you own, you
+# edit that, and when the editor closes, root copies your changes back
+# (the file keeps its owner and permissions). No password: root is already
+# root, and handing the editor to you needs none.
+#
+# Used by yazi: Smart Right (terminal) and the `edit` opener (Zed).
+
+set -u
+gui=0
+[ "${1-}" = --gui ] && { gui=1; shift; }
+[ "${1-}" = -- ] && shift
+[ $# -gt 0 ] || { echo "usage: sedit [--gui] FILE..." >&2; exit 2; }
+
+if (( gui )); then
+    command -v zeditor >/dev/null || { echo "sedit: Zed (zeditor) isn't installed" >&2; exit 1; }
+fi
+term_editor=${EDITOR:-}
+[ -n "$term_editor" ] || { command -v micro >/dev/null && term_editor=micro || term_editor=nano; }
+
+user=${SUDO_USER-}
+if [ "$(id -u)" != 0 ] || [ -z "$user" ] || [ "$user" = root ]; then
+    # yourself (or a real root login): open them directly
+    if (( gui )); then
+        setsid -f zeditor -- "$@" >/dev/null 2>&1    # don't hold yazi up
+        exit 0
+    fi
+    exec $term_editor -- "$@"
+fi
+
+# ---- root through sudo: edit copies as the user, write changes back as root
+tmpdir=$(mktemp -d /tmp/sedit.XXXXXX) || exit 1
+chown "$user" "$tmpdir"; chmod 700 "$tmpdir"
+trap 'rm -rf -- "$tmpdir"' EXIT
+copies=() i=0
+for f in "$@"; do
+    i=$((i + 1))
+    c=$tmpdir/$i/$(basename -- "$f")       # same name, so syntax colours work
+    mkdir -p -- "$tmpdir/$i"
+    if [ -e "$f" ]; then
+        [ -f "$f" ] || { echo "sedit: not a regular file: $f" >&2; exit 1; }
+        cat -- "$f" > "$c" || exit 1
+    else
+        : > "$c"
+    fi
+    chown -R "$user" "$tmpdir/$i"; chmod 600 "$c"
+    copies+=("$c")
+done
+
+as_user=(sudo -u "$user" --preserve-env=EDITOR,WAYLAND_DISPLAY,XDG_RUNTIME_DIR,DISPLAY)
+if (( gui )); then
+    "${as_user[@]}" zeditor --wait -- "${copies[@]}"
+else
+    "${as_user[@]}" $term_editor -- "${copies[@]}"
+fi
+
+# copy back what changed (writing into the file keeps its owner and mode)
+rc=0 i=0
+for f in "$@"; do
+    c=${copies[$i]}; i=$((i + 1))
+    if [ -e "$f" ]; then
+        cmp -s -- "$c" "$f" && continue
+        cat -- "$c" > "$f" || { echo "sedit: couldn't write $f (your edit: $c)" >&2; trap - EXIT; rc=1; }
+    elif [ -s "$c" ]; then
+        install -m 644 -- "$c" "$f" || { echo "sedit: couldn't create $f" >&2; rc=1; }
+    fi
+done
+exit $rc

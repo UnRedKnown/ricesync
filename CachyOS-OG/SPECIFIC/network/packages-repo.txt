@@ -1,0 +1,8 @@
+dnsmasq
+libvirt
+qemu-base
+qemu-full
+samba
+tailscale
+ufw
+virt-manager

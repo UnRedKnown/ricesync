@@ -1,0 +1,7 @@
+# dotsync config
+MACHINES="@HOSTNAME@ @HOSTNAME@"
+NAMES="@HOSTNAME@=PC @HOSTNAME@=Laptop"
+
+SSH_USER=red
+REPO=~/dev/dotfiles
+LIST=dotsync.list

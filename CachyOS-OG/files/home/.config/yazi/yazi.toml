@@ -1,0 +1,27 @@
+[mgr]
+show_hidden = true
+
+[opener]
+# Enter on text: Zed (in root yazi: as you, on a copy - see sedit)
+edit = [
+    { run = 'sedit --gui %s', block = true, desc = "Zed", for = "unix" },
+]
+# archives: ouch for everything
+extract = [
+    { run = 'ouch decompress %s', block = true, desc = "Extract here", for = "unix" },
+]
+contents = [
+    { run = 'ouch list %s1 | less', block = true, desc = "Show contents", for = "unix" },
+]
+appimage = [
+    { run = 'chmod +x %s1 && kitty -e %s1', orphan = true, desc = "Run in new kitty", for = "unix" },
+    { run = 'chmod +x %s1 && %s1', block = true, desc = "Run here", for = "unix" },
+]
+
+[open]
+prepend_rules = [
+    { mime = "video/*", use = ["open", "play"] },
+    { url = "*.{zip,7z,rar,tar,tgz,tbz2,txz,tzst,tar.gz,tar.xz,tar.zst,tar.bz2,tar.lz4,gz,xz,zst,bz2,lz4}", use = ["extract", "contents"] },
+    { mime = "application/{zip,x-7z-compressed,vnd.rar,x-rar,x-tar,gzip,x-xz,zstd,x-bzip2,x-lz4}", use = ["extract", "contents"] },
+    { url = "*.{AppImage,appimage}", use = ["appimage", "reveal"] },
+]

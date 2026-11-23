@@ -1,0 +1,85 @@
+#!/bin/sh
+# yazi-filechooser - yazi as the file picker for xdg-desktop-portal-termfilechooser
+#
+# Called by the portal as:  yazi-filechooser MULTIPLE DIRECTORY SAVE PATH OUT
+#   MULTIPLE   1 = several files may be chosen
+#   DIRECTORY  1 = choose a folder instead of a file
+#   SAVE       1 = "save as" dialog; PATH is the suggested file
+#   PATH       where to start (may be empty)
+#   OUT        file to write the chosen paths to, one per line
+#
+# In yazi:
+#   open / save:   select with Enter (Space marks several, if allowed)
+#   choose folder: go into the folder, then quit with  q
+#                  (Enter on a file picks that file instead: some apps,
+#                  like Zed, ask for a folder but take a file just as well)
+#   cancel:        quit with  Q  (capital), or close the window
+# yazi only picks here, it never opens anything: Enter and Smart Right
+# (which sees YAZI_FILECHOOSER=1) choose the file instead of opening it.
+#
+# Set in ~/.config/xdg-desktop-portal-termfilechooser/config:
+#   cmd=/usr/local/bin/yazi-filechooser
+
+multiple=$1
+directory=$2
+save=$3
+path=$4
+out=$5
+
+# Terminal to open yazi in. The class gives the window its own app-id
+# ("termfilechooser") for niri window rules.
+TERMCMD=${TERMCMD:-kitty --class termfilechooser --title termfilechooser -o confirm_os_window_close=0}
+export YAZI_FILECHOOSER=1
+
+[ -n "$out" ] || { echo "yazi-filechooser: no output file given" >&2; exit 1; }
+[ -n "$path" ] || path=$HOME
+: > "$out"
+
+PLACEHOLDER_TEXT='This file was created by the file chooser as a save location.
+Select it in yazi (Enter) to save here, or quit with Q to cancel.
+The application will overwrite this text.'
+
+if [ "$save" = 1 ]; then
+    # Create the suggested file so yazi can start with it selected. It is
+    # removed again afterwards unless it was chosen (and only if it still
+    # holds exactly our text, so nothing real is ever deleted).
+    placeholder=""
+    if [ ! -e "$path" ]; then
+        mkdir -p -- "$(dirname -- "$path")" 2>/dev/null
+        printf '%s\n' "$PLACEHOLDER_TEXT" > "$path" && placeholder=$path
+    fi
+    $TERMCMD -e yazi --chooser-file="$out" -- "$path"
+    if [ -n "$placeholder" ] && ! grep -qxF -- "$placeholder" "$out" \
+       && printf '%s\n' "$PLACEHOLDER_TEXT" | cmp -s - "$placeholder"; then
+        rm -f -- "$placeholder"
+    fi
+
+elif [ "$directory" = 1 ]; then
+    # Folder picker: yazi writes its current folder on quit (q, not Q).
+    # Enter on a file picks that file instead (and closes yazi).
+    cwd_file=$(mktemp) picked=$(mktemp)
+    [ -d "$path" ] || path=$(dirname -- "$path")
+    $TERMCMD -e yazi --chooser-file="$picked" --cwd-file="$cwd_file" -- "$path"
+    if [ -s "$picked" ]; then
+        head -n 1 -- "$picked" > "$out"
+    elif [ -s "$cwd_file" ]; then
+        { cat -- "$cwd_file"; echo; } > "$out"
+    fi
+    rm -f -- "$cwd_file" "$picked"
+
+else
+    $TERMCMD -e yazi --chooser-file="$out" -- "$path"
+    # Only one file wanted: keep just the first
+    if [ "$multiple" != 1 ] && [ -s "$out" ]; then
+        first=$(head -n 1 -- "$out")
+        printf '%s\n' "$first" > "$out"
+    fi
+fi
+
+# Record the last request, to help with "it only picked one file" kind of
+# problems: what the app asked for, and what was handed back
+{
+    echo "multiple=$multiple directory=$directory save=$save path=$path"
+    echo "chosen:"
+    cat -- "$out"
+} > "${XDG_RUNTIME_DIR:-/tmp}/yazi-filechooser.log" 2>/dev/null

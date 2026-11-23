@@ -1,0 +1,3 @@
+[filechooser]
+cmd=/usr/local/bin/yazi-filechooser
+default_dir=@HOME@

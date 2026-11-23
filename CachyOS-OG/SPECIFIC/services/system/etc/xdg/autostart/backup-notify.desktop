@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Backup snapshot size warning
+Exec=/usr/local/bin/backup --notify
+NoDisplay=true

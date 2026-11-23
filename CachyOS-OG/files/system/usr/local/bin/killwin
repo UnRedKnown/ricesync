@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# killwin - force-kill the focused window's program (SIGKILL), for when it
+# won't close normally. Bound in niri, e.g.  Mod+Ctrl+Q { spawn "killwin"; }
+#
+# Wayland apps: killed right away (the whole program: every window of it).
+# X11 apps run through xwayland-satellite, so niri only knows the satellite's
+# process, and killing that would close every X11 app at once. For those it
+# asks first, with a Kill button that targets the app itself:
+#   Steam games (app id steam_app_NUMBER): every process of that game
+#     (Proton marks them all with the game's Steam id)
+#   anything else: pkill -9 -f on its app id
+set -u
+note() { notify-send -a killwin "$@" 2>/dev/null || printf '%s\n' "$*" >&2; }
+
+json=$(niri msg -j focused-window 2>/dev/null) || { note "Couldn't ask niri for the window"; exit 1; }
+pid=$(jq -r '.pid // empty' <<<"$json")
+app=$(jq -r '.app_id // empty' <<<"$json")
+title=$(jq -r '.title // empty' <<<"$json")
+[[ $pid =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] || { note "No focused window"; exit 1; }
+name=$(cat "/proc/$pid/comm" 2>/dev/null) || { note "Already gone"; exit 1; }
+
+# never: the desktop itself
+case $name in niri|noctalia|qs|quickshell) note "Not killing $name"; exit 1 ;; esac
+
+# --- an ordinary (Wayland) app: kill it
+case $name in
+    xwayland-satell*|Xwayland) ;;
+    *) kill -9 "$pid" && note "Killed $name"; exit ;;
+esac
+
+# --- an X11 app: find the app's own processes, then ask
+label=${title:-$app}; label=${label:0:40}
+if [[ $app =~ ^steam_app_([0-9]+)$ ]]; then
+    id=${BASH_REMATCH[1]}
+    targets() {
+        for d in /proc/[0-9]*; do
+            [ -O "$d" ] || continue
+            { tr '\0' '\n' < "$d/environ"; } 2>/dev/null |
+                grep -q -x -E "(SteamAppId|STEAM_COMPAT_APP_ID|SteamGameId)=$id" && echo "${d#/proc/}"
+        done
+    }
+    what="game $id"
+else
+    # app id as a literal pattern; refuse ones too short or too general
+    if [ ${#app} -lt 3 ] || [[ $app =~ ^(niri|noctalia|xwayland|Xwayland|org|com|app)$ ]]; then
+        note "Can't tell which program \"$label\" is"; exit 1
+    fi
+    pat=$(printf '%s' "$app" | sed 's/[][\.*^$+?(){}|/]/\\&/g')
+    targets() { pgrep -u "$(id -u)" -f -i -- "$pat" | grep -v -x -e "$$" -e "$PPID"; }
+    what=$app
+fi
+
+[ -n "$(targets)" ] || { note "No process found for \"$label\""; exit 1; }
+choice=$(notify-send -a killwin -u critical -A "kill=Kill" -t 15000 "Kill \"$label\"?" 2>/dev/null)
+[ "$choice" = kill ] || exit 0
+pids=$(targets)
+[ -n "$pids" ] || exit 0
+kill -9 $pids 2>/dev/null
+note "Killed $what"

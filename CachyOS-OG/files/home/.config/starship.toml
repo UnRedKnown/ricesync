@@ -1,0 +1,78 @@
+# Colours are kitty's palette slots (set by Noctalia), so everything already
+# on screen recolours when the wallpaper changes, like fastfetch.
+#   green = primary   yellow = secondary   blue = tertiary   red = error
+#   black = surface_variant (the dark blocks)   bright-black = outline
+#   white = on_surface_variant   magenta, cyan = extra accents
+
+"$schema" = 'https://starship.rs/config-schema.json'
+add_newline = true
+
+format = """
+([](fg:black)\
+$jobs\
+[](fg:black))\
+([](fg:black)\
+$cmd_duration\
+$status\
+[](fg:black)
+)$time\
+$username\
+$hostname\
+[](fg:black)\
+([ ](fg:black)\
+$git_branch\
+$git_status\
+[](fg:black))\
+$line_break\
+$directory\
+$sudo\
+$character"""
+
+[jobs]
+format = "[ $number](bg:black fg:yellow)"
+number_threshold = 1
+
+[cmd_duration]
+min_time = 2000
+format = "[$duration ](bg:black fg:green)"
+
+[status]
+disabled = false
+format = "[$status](bg:black fg:red)"
+
+[time]
+disabled = false
+time_format = "%R"
+format = "[ $time ](bg:black fg:green)"
+
+[username]
+show_always = true
+format = "[$user](bg:black fg:green)"
+style_user = ""
+style_root = ""
+
+[hostname]
+ssh_only = false
+format = "[@$hostname ](bg:black fg:green)"
+
+[git_branch]
+symbol = ""
+format = "[ $symbol $branch ](bg:black fg:green)"
+
+[git_status]
+format = "[($all_status$ahead_behind )](bg:black fg:green)"
+
+[directory]
+truncation_length = 3
+truncation_symbol = "…/"
+format = "[$read_only$path ](fg:green)"
+read_only = "󰌾 "
+truncate_to_repo = false
+
+[sudo]
+disabled = false
+format = "[󰔙](fg:green)"
+
+[character]
+success_symbol = "[❯](bold fg:green)"
+error_symbol = "[❯](bold fg:red)"

@@ -1,0 +1,152 @@
+# ~/.config/yazi/keymap.toml
+# Right arrow / l: folders (root ones offer root yazi), text -> $EDITOR,
+# archives -> extract, audio -> play
+[[mgr.prepend_keymap]]
+on   = "<Right>"
+run  = "plugin smart-right"
+desc = "Enter / edit / extract / play"
+
+[[mgr.prepend_keymap]]
+on   = "l"
+run  = "plugin smart-right"
+desc = "Enter / edit / extract / play"
+
+[[mgr.prepend_keymap]]
+on   = "o"
+run  = "open --interactive"
+desc = "Open with..."
+
+# ---- going places ----------------------------------------------------------------
+[[mgr.prepend_keymap]]
+on   = ["g", "h"]
+run  = "plugin rootyazi home"
+desc = "Go home"
+
+[[mgr.prepend_keymap]]
+on   = ["g", "w"]
+run  = "cd ~/Pictures/Wallpapers"
+desc = "Go to wallpapers"
+
+[[mgr.prepend_keymap]]
+on   = ["g", "/"]
+run  = "cd /"
+desc = "Go to root"
+
+[[mgr.prepend_keymap]]
+on   = ["g", "b"]
+run  = "cd /usr/local/bin"
+desc = "Go to scripts"
+
+[[mgr.prepend_keymap]]
+on   = ["g", "s"]
+run  = "cd ~/Settings"
+desc = "Go to Settings"
+
+[[mgr.prepend_keymap]]
+on   = ["g", "p"]
+run  = "cd ~/Pictures"
+desc = "Go to Pictures"
+
+[[mgr.prepend_keymap]]
+on   = ["g", "v"]
+run  = "cd ~/Videos"
+desc = "Go to Videos"
+
+[[mgr.prepend_keymap]]
+on   = ["g", "r"]
+run  = "cd /run/media/@USER@"
+desc = "Go to removable devices"
+
+[[mgr.prepend_keymap]]
+on   = "<A-s>"
+run  = ["cd /", "search --via=fd --args='-HI'"]
+desc = "Search the whole system"
+
+[[mgr.prepend_keymap]]
+on   = "!"
+run  = 'shell "$SHELL" --block'
+desc = "Open a shell here"
+
+# ---- keys that may need root (rootyazi) --------------------------------------------
+# In your yazi each one checks first and offers root yazi where it can't work;
+# where it can, it's yazi's own command. In root yazi they're always yazi's own.
+[[mgr.prepend_keymap]]
+on   = ["e", "r"]
+run  = "plugin rootyazi root"
+desc = "Root yazi on/off"
+
+[[mgr.prepend_keymap]]
+on   = "<Enter>"
+run  = "plugin rootyazi open"
+desc = "Open"
+
+[[mgr.prepend_keymap]]
+on   = "p"
+run  = "plugin rootyazi paste"
+desc = "Paste"
+
+[[mgr.prepend_keymap]]
+on   = "P"
+run  = "plugin rootyazi paste_over"
+desc = "Paste, replace"
+
+[[mgr.prepend_keymap]]
+on   = "d"
+run  = "plugin rootyazi trash"
+desc = "Trash"
+
+[[mgr.prepend_keymap]]
+on   = "D"
+run  = "plugin rootyazi delete"
+desc = "Delete"
+
+[[mgr.prepend_keymap]]
+on   = "r"
+run  = "plugin rootyazi rename"
+desc = "Rename"
+
+[[mgr.prepend_keymap]]
+on   = "a"
+run  = "plugin rootyazi create"
+desc = "Create"
+
+[[mgr.prepend_keymap]]
+on   = "-"
+run  = "plugin rootyazi link"
+desc = "Symlink (absolute)"
+
+[[mgr.prepend_keymap]]
+on   = "_"
+run  = "plugin rootyazi link_rel"
+desc = "Symlink (relative)"
+
+[[mgr.prepend_keymap]]
+on   = "<C-->"
+run  = "plugin rootyazi hardlink"
+desc = "Hardlink"
+
+[[mgr.prepend_keymap]]
+on   = "<C-v>"
+run  = "plugin rootyazi paste_clip"
+desc = "Paste clipboard"
+
+# ---- e: my menu ----------------------------------------------------------------------
+[[mgr.prepend_keymap]]
+on   = ["e", "c"]
+run  = "plugin rootyazi pack"
+desc = "Archive"
+
+[[mgr.prepend_keymap]]
+on   = ["e", "s"]
+run  = "plugin dotsync-rule"
+desc = "dotsync rule"
+
+[[mgr.prepend_keymap]]
+on   = ["e", "x"]
+run  = "plugin perms mode"
+desc = "chmod"
+
+[[mgr.prepend_keymap]]
+on   = ["e", "o"]
+run  = "plugin perms owner"
+desc = "chown"

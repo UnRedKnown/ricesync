@@ -1,0 +1,7 @@
+{
+    "version": "2.2.1",
+    "autoload": {
+        "Logitech Signature M650 L": "sidebtns"
+    },
+    "enable_system_tray": true
+}

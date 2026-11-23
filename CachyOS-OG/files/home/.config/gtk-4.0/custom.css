@@ -1,0 +1,39 @@
+@import url("noctalia-glass.css");
+/* custom.css - my additions to GTK4/libadwaita apps' look
+ *
+ * Loaded from ~/.config/gtk-4.0/gtk.css with this as its FIRST line:
+ *     @import url("custom.css");
+ * (GTK only accepts @import before everything else in the file.)
+ *
+ * Applies to every GTK4 app (Cartridges, the file picker, Satty, the
+ * calculator, ...): GTK's CSS can't target a single app.
+ */
+
+/* See-through windows: the window itself gets a translucent background,
+   everything stacked on top of it is made clear so the wallpaper shows */
+window.background {
+    background-color: alpha(@noctalia_glass, 0.8);
+}
+.view, flowbox, gridview, listview, scrolledwindow,
+toolbarview, toolbarview > .top-bar, toolbarview > .bottom-bar,
+navigation-view, navigation-view > *, overlay-split-view, .content-pane {
+    background-color: transparent;
+}
+
+/* Header bar (Cartridges' search and menu live there): flat and clear,
+   no line or shadow under it */
+headerbar, toolbarview > .top-bar headerbar {
+    background-color: transparent;
+    box-shadow: none;
+    border: none;
+}
+
+/* Sidebars: a touch darker than the window, still see-through */
+.sidebar-pane {
+    background-color: alpha(@noctalia_glass, 0.35);
+}
+
+/* Cartridges: game cards keep a light glass so covers stand out */
+flowbox > flowboxchild .card {
+    background-color: alpha(@card_bg_color, 0.55);
+}

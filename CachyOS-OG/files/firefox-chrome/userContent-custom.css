@@ -1,0 +1,417 @@
+/* Noctalia's surface colour (same as kitty's background), as --noctalia-glass.
+   Must stay the first rule in this file. */
+@import url("noctalia-glass.css");
+
+@media -moz-pref("user.glass.enabled") {
+html {
+   background-color: color-mix(in srgb, var(--noctalia-glass, rgb(16, 16, 20)) 80%, transparent) !important;   /* dark glass */
+}
+body {
+   background: transparent !important;
+}
+
+/* userContent-custom.css - own page styles (loaded by newtab-wallpaper's
+ *  userContent.css). Firefox reads it at startup: restart after changes.
+ *  Tint: Noctalia's colour mixed with clear, the % is the opacity (lower =
+ *  more see-through); set it with: glass 0.75 */
+
+/* ---- See-through sites: one tint over the blurred wallpaper ---------- */
+/* domain("youtube.com") also covers www. and music.youtube.com */
+@-moz-document domain("youtube.com"), domain("claude.ai") {
+   html { background-color: color-mix(in srgb, var(--noctalia-glass, rgb(16, 16, 20)) 80%, transparent) !important; }
+   body { background: transparent !important; }
+}
+
+/* ---- New tab: see-through, no tint ------------------------------------- */
+@-moz-document url("about:newtab"), url("about:home") {
+   html, body, .outer-wrapper, main, .non-collapsible-section {
+      background: transparent !important;
+   }
+}
+
+/* ---- YouTube --------------------------------------------------------- */
+@-moz-document domain("www.youtube.com") {
+   html {
+      --yt-spec-base-background: transparent !important;
+      --yt-spec-general-background-a: transparent !important;
+      --yt-spec-general-background-b: transparent !important;
+      --yt-spec-general-background-c: transparent !important;
+   }
+   ytd-app, #content, #page-manager, ytd-browse, ytd-watch-flexy,
+   ytd-two-column-browse-results-renderer, ytd-rich-grid-renderer,
+   #masthead-container, ytd-masthead, #frosted-glass, #background,
+   tp-yt-app-drawer #contentContainer, #guide-content, ytd-mini-guide-renderer {
+      background: transparent !important;
+   }
+}
+
+/* ---- YouTube Music --------------------------------------------------- */
+@-moz-document domain("music.youtube.com") {
+    html {
+        --ytmusic-background: transparent !important;
+        --ytmusic-general-background-a: transparent !important;
+        --ytmusic-general-background-c: transparent !important;
+    }
+    ytmusic-app, ytmusic-app-layout, #layout, #content, ytmusic-browse-response,
+    ytmusic-player-page, ytmusic-nav-bar, #nav-bar-background,
+    #player-bar-background, #guide-wrapper, #mini-guide-background,
+    ytmusic-guide-renderer, #guide-content {
+        background: transparent !important;
+    }
+    /* home page: the dark gradient behind the shelves (it spans the whole
+       window, so it shows up as a band over the wallpaper). The box also
+       holds the shelves, so only its gradient goes */
+    ytmusic-browse-response .background-gradient {
+        background: none !important;
+    }
+    /* and the big blurred picture at the top (only the picture: hidden,
+       not removed, so nothing around it moves) */
+    ytmusic-browse-response ytmusic-fullbleed-thumbnail-renderer img.image {
+        visibility: hidden !important;
+    }
+}
+
+/* ---- claude.ai -------------------------------------------------------- */
+@-moz-document domain("claude.ai") {
+    /* Full-page backdrop layer and main area: clear */
+    .bg-surface-1, .dframe-content, .session-list,
+    /* Strip behind the message box, including the two side pieces that
+       show when there's a message below it */
+    [class*="dock-masked"], [class*="dock-masked"] > div,
+    .absolute.top-full.bg-page,
+    .relative.z-0.overflow-clip.px-2 {
+        background-color: transparent !important;
+    }
+    /* Chat list sidebar: same glass as the top bar */
+    aside.dframe-sidebar {
+        background-color: rgba(25, 25, 25, 0.85) !important;
+    }
+    /* Files panel on the right: same glass as the chat list */
+    aside[aria-label="Session activity panel"] {
+        background-color: rgba(25, 25, 25, 0.85) !important;
+    }
+    /* The gap above that panel: the top bar stops short of it, so the top
+       bar casts a copy of itself 20rem (the panel's width) to the right.
+       Drawn at the top bar's level, so it stays below the buttons. */
+    div[style*="--chat-body-end-inset"][style*="--cds-ring-outer"] {
+        box-shadow: 20rem 0 0 0 rgba(25, 25, 25, 0.85) !important;
+    }
+    /* The strip's solid 32px shadow made the dark rectangle; the side
+       pieces keep a thin edge of their own */
+    .relative.z-0.overflow-clip.px-2,
+    .absolute.top-full.bg-page {
+        box-shadow: none !important;
+        border-color: transparent !important;
+        outline: none !important;
+    }
+    /* The message box: its own fill and outline, inside its rounded shape.
+       (While loading it's a .bg-surface-3 box; once the app is up, claude.ai
+       rebuilds it as .rounded-composer, which the rules above made clear.) */
+    div.bg-surface-3:has([contenteditable="true"]),
+    div.rounded-composer:has(.ProseMirror) {
+        background-color: rgb(25, 25, 25) !important;   /* see-through: rgba(25, 25, 25, 0.75) */
+        border-radius: 14px !important;
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12) !important;
+    }
+}
+
+/* ---- Messenger -------------------------------------------------------- */
+@-moz-document domain("messenger.com") {
+   /* Panels (chat list, conversation, details) are painted with these
+    *       variables: make them see-through instead of solid #1f1f1f */
+   :root, .__fb-dark-mode {
+      --messenger-card-background: rgba(31, 31, 31, 0.65) !important;
+      --surface-background: transparent !important;
+   }
+   /* Conversation header (theme colour, normally solid) */
+   [style*="--mwp-header-background-color"] {
+      --mwp-header-background-color: rgba(63, 63, 63, 0.6) !important;
+   }
+
+   /* ---- Gradient themes ----
+    *       Messenger paints one big gradient behind the chat and covers
+    *       everything except your bubbles with the panel colour. Instead: no big
+    *       gradient, no cover, and the gradient painted on your bubbles directly,
+    *       fixed to the window so the colour still shifts from top to bottom. */
+   [role="main"]:has([style*="--chat-outgoing-message-background-gradient"]:not([style*="--chat-outgoing-message-background-gradient: initial"])) .__fb-dark-mode.x1xsqp64 {
+      background-image: none !important;
+   }
+   [role="main"]:has([style*="--chat-outgoing-message-background-gradient"]:not([style*="--chat-outgoing-message-background-gradient: initial"])) [role="log"],
+   [role="main"]:has([style*="--chat-outgoing-message-background-gradient"]:not([style*="--chat-outgoing-message-background-gradient: initial"])) [role="log"] .__fb-dark-mode {
+      --messenger-card-background: transparent !important;
+   }
+   /* Your bubbles: the bubble element, minus the classes only incoming
+    *       bubbles have. In non-gradient themes the variable is "initial", so
+    *       this adds nothing there. */
+   [role="log"] div[role="presentation"]:has(> span.x14ctfv) {
+      background-image: var(--chat-outgoing-message-background-gradient) !important;
+      background-attachment: fixed !important;
+      background-size: 100vw 100vh !important;
+   }
+   /* 4px panel-coloured line along the bottom of the conversation, just
+    *  above the message box (an inset shadow on the conversation layer) */
+   [role="main"] .__fb-dark-mode.x1xsqp64 {
+      box-shadow: none !important;
+   }
+   /* Rows (date separators etc.) painted directly, not through the variables;
+    *  bubbles (which hold their text in a direct <span>) are left alone */
+   [role="main"]:has([style*="--chat-outgoing-message-background-gradient"]:not([style*="--chat-outgoing-message-background-gradient: initial"])) [role="log"] div[role="presentation"]:not(:has(> span)) {
+      background-color: transparent !important;
+   }
+
+   /* ---- Picture themes ----
+    *       Background image at ~60%: moved onto a layer behind the messages, and
+    *       only that layer is faded. */
+   [role="main"]:not(:has([style*="--chat-outgoing-message-background-gradient"]:not([style*="--chat-outgoing-message-background-gradient: initial"]))) .__fb-dark-mode.x1xsqp64 {
+      position: relative !important;
+      isolation: isolate !important;
+      background-size: 0 0 !important;
+   }
+   [role="main"]:not(:has([style*="--chat-outgoing-message-background-gradient"]:not([style*="--chat-outgoing-message-background-gradient: initial"]))) .__fb-dark-mode.x1xsqp64::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: -1;
+      pointer-events: none;
+      background-image: inherit;
+      background-position: center;
+      background-repeat: no-repeat;
+      background-size: cover;
+      opacity: 0.6;
+   }
+}
+
+/* ---- Google Translate ------------------------------------------------- */
+@-moz-document domain("translate.google.com") {
+   /* Big dark panel behind both boxes */
+   .ccvoYb {
+      background-color: transparent !important;
+   }
+   /* Input box: its own fill inside its rounded border (output box has one) */
+   c-wiz[jsname="qIkIQe"] {
+      background-color: rgb(19, 19, 20) !important;
+      border-radius: 16px !important;
+   }
+   /* History / Saved circles, and the unselected mode buttons (Obrazy,
+    *      Dokumenty, ...): claude.ai top-bar glass. The selected one
+    *      (aria-current="page") keeps its blue. */
+   .ySES5,
+   button.Rj2Mlf:not([aria-current="page"]) {
+      background-color: rgba(25, 25, 25, 0.85) !important;
+   }
+   /* Fade-out gradient at the end of the mode buttons row */
+   nav.U0xwnf::after {
+      background-image: none !important;
+   }
+   /* Fade-out gradients at the end of the mode buttons row and of both
+    *  language rows */
+   nav.U0xwnf::after,
+   .X4DQ0.zWsGpc::after {
+      background-image: none !important;
+   }
+   /* Full language list: one see-through layer (the inner one cleared, so
+    *  the two don't stack) */
+   c-wiz[jsname="IDUZgd"] {
+      background-color: rgba(19, 19, 20, 0.85) !important;
+   }
+   c-wiz[jsname="IDUZgd"] .pEyuac {
+      background-color: transparent !important;
+   }
+}
+
+/* ---- Microsoft Teams (first pass) ------------------------------------- */
+/* New Teams runs on teams.cloud.microsoft (teams.microsoft.com sends you
+ *   there); teams.live.com is the personal one. It's built with Fluent UI,
+ *   which paints everything from a few colour variables: those are made
+ *   see-through instead of solid. Hover / pressed / selected become a light
+ *   veil over the glass, so they don't punch solid grey holes in it. */
+@-moz-document domain("teams.microsoft.com"), domain("teams.cloud.microsoft"), domain("teams.live.com") {
+   .fui-FluentProvider, [class*="fui-FluentProvider"] {
+      /* main areas: chat, channel, calendar ... */
+      --colorNeutralBackground1: rgba(31, 31, 31, 0.55) !important;
+      --colorNeutralBackground2: rgba(25, 25, 25, 0.45) !important;
+      /* side panels and the app bar on the left */
+      --colorNeutralBackground3: rgba(20, 20, 20, 0.35) !important;
+      --colorNeutralBackground4: rgba(16, 16, 16, 0.3) !important;
+      --colorNeutralBackground5: rgba(10, 10, 10, 0.3) !important;
+      --colorNeutralBackground6: rgba(40, 40, 40, 0.5) !important;
+      --colorNeutralBackgroundAlpha: transparent !important;
+      --colorNeutralBackgroundAlpha2: transparent !important;
+      --colorSubtleBackground: transparent !important;
+      --colorTransparentBackground: transparent !important;
+
+      --colorNeutralBackground1Hover: rgba(255, 255, 255, 0.07) !important;
+      --colorNeutralBackground1Pressed: rgba(255, 255, 255, 0.04) !important;
+      --colorNeutralBackground1Selected: rgba(255, 255, 255, 0.1) !important;
+      --colorNeutralBackground2Hover: rgba(255, 255, 255, 0.07) !important;
+      --colorNeutralBackground2Pressed: rgba(255, 255, 255, 0.04) !important;
+      --colorNeutralBackground2Selected: rgba(255, 255, 255, 0.1) !important;
+      --colorNeutralBackground3Hover: rgba(255, 255, 255, 0.07) !important;
+      --colorNeutralBackground3Pressed: rgba(255, 255, 255, 0.04) !important;
+      --colorNeutralBackground3Selected: rgba(255, 255, 255, 0.1) !important;
+      --colorSubtleBackgroundHover: rgba(255, 255, 255, 0.07) !important;
+      --colorSubtleBackgroundPressed: rgba(255, 255, 255, 0.04) !important;
+      --colorSubtleBackgroundSelected: rgba(255, 255, 255, 0.1) !important;
+   }
+   /* Loading screen: only the logo over the tinted, blurred wallpaper
+    *       (first try: the screen's own names aren't known yet) */
+   [id*="loading" i], [class*="loading-screen" i], [class*="loadingScreen" i],
+   [id*="splash" i], [class*="splash" i] {
+      background: transparent !important;
+      box-shadow: none !important;
+   }
+   /* the black bar along the top of the loading screen */
+   [data-tid="pre-core-title-bar"] {
+      background: transparent !important;
+   }
+   /* menus, popups and dialogs float over everything: keep them readable */
+   [role="menu"], [role="listbox"], [role="dialog"], [role="tooltip"],
+   .fui-PopoverSurface, .fui-MenuPopover, .fui-DialogSurface {
+      background-color: rgba(31, 31, 31, 0.92) !important;
+   }
+}
+
+/* ---- Teams: Assignments (first pass) ----------------------------------- */
+/* The Assignments tab is a separate page shown inside Teams, from
+ *   assignments.edu.cloud.microsoft, so the Teams rules above don't reach it.
+ *   Its own background is cleared (Teams' tint is already behind it), and the
+ *   same Fluent UI colours are made see-through. */
+@-moz-document domain("assignments.edu.cloud.microsoft"), domain("assignments.onenote.com") {
+   html, body { background: transparent !important; }
+   .fui-FluentProvider, [class*="fui-FluentProvider"], :root {
+      --colorNeutralBackground1: rgba(31, 31, 31, 0.55) !important;
+      --colorNeutralBackground2: rgba(25, 25, 25, 0.45) !important;
+      --colorNeutralBackground3: rgba(20, 20, 20, 0.35) !important;
+      --colorNeutralBackground4: rgba(16, 16, 16, 0.3) !important;
+      --colorNeutralBackground5: rgba(10, 10, 10, 0.3) !important;
+      --colorSubtleBackground: transparent !important;
+      --colorNeutralBackground1Hover: rgba(255, 255, 255, 0.07) !important;
+      --colorNeutralBackground1Pressed: rgba(255, 255, 255, 0.04) !important;
+      --colorNeutralBackground1Selected: rgba(255, 255, 255, 0.1) !important;
+      --colorSubtleBackgroundHover: rgba(255, 255, 255, 0.07) !important;
+   }
+   /* its theme paints the list and the menu above it in a fixed solid
+    *       colour, not from the variables. Cleared: Teams' own panel behind the
+    *       tab already gives the same glass as the chat */
+   [class*="fui-FluentProviderEDUASSIGN"], [class*="header-container__"] {
+      background-color: transparent !important;
+   }
+   /* assignment cards: a light veil, so they still stand out */
+   [class*="content-container__"] {
+      background-color: rgba(255, 255, 255, 0.06) !important;
+   }
+}
+
+/* ---- Google search: AI Overview ------------------------------------------ */
+@-moz-document domain("www.google.com"), domain("www.google.pl") {
+   /* The rainbow ring around "Dive deeper in AI Mode" (one for the
+    *       collapsed overview, one for the open one): a plain glass edge instead.
+    *       The ring's shape comes from a mask on its parent, so only the
+    *       colour changes. */
+   .UEnp2c {
+      background: rgba(255, 255, 255, 0.22) !important;
+      animation: none !important;
+   }
+   /* Fades that hide the cut-off text (bottom of the collapsed overview,
+    *       under "Show more", ends of scrolling rows). They fade into a solid
+    *       rgb(34, 36, 42), which shows up as a dark band over the glass:
+    *       removed. */
+   .Zze5V, .bPlg5e, .RDmXvc, .b0Zsmc, .lKiHcd.MyTwIe::after, .F9Idpe {
+      background-image: none !important;
+   }
+}
+
+/* ---- WhatsApp (first pass) -------------------------------------------- */
+/* WhatsApp paints from colour variables (WDS-...), set on several elements
+   down the page, so they're replaced on every element. Panels get the same
+   glass as Messenger; the chat background (colour and doodle pattern) is
+   gone; bubbles and the message box stay solid so text stays readable. */
+@-moz-document domain("web.whatsapp.com") {
+    :root, :root * {
+        /* page and chat backgrounds: clear */
+        --WDS-background-wash-plain: transparent !important;
+        --WDS-background-wash-inset: transparent !important;
+        --WDS-systems-chat-background-wallpaper: transparent !important;
+        --app-background: transparent !important;
+        --app-background-deeper: transparent !important;
+        /* chat list, headers, info drawer */
+        --WDS-surface-default: rgba(22, 23, 23, 0.3) !important;
+        --WDS-surface-emphasized: rgba(29, 31, 31, 0.4) !important;
+        --WDS-systems-chat-surface-tray: rgba(22, 23, 23, 0.3) !important;
+        --WDS-components-surface-nav-bar: rgba(29, 31, 31, 0.4) !important;
+        --navbar-background: rgba(29, 31, 31, 0.4) !important;
+        --panel-background: rgba(22, 23, 23, 0.3) !important;
+        --panel-background-deep: rgba(22, 23, 23, 0.3) !important;
+        /* the loading screen: WhatsApp starts it in its light colours and
+           only switches to dark a moment later (the white flash) */
+        --splashscreen-startup-background: transparent !important;
+        --splashscreen-startup-background-plain: transparent !important;
+        --splashscreen-progress-background: rgba(255, 255, 255, 0.1) !important;
+    }
+    body, #app, #initial_startup {
+        background-color: transparent !important;
+    }
+    /* the app frame (class "two" without a chat open, "three" with one)
+       and the chat area */
+    div.two, div.three, [data-testid="conversation-panel-wrapper"] {
+        background-color: transparent !important;
+    }
+    /* chat background doodles (old WhatsApp: marked by name) */
+    [data-asset-chat-background-dark], [data-asset-chat-background-light] {
+        display: none !important;
+    }
+    /* The pattern layer's class names (full-size, pinned to the top left)
+       are shared with other layers, the message list among them, so it
+       can't be hidden by name. Instead its picture and colour are taken
+       away: the pattern disappears, the other layers lose nothing. */
+    [data-testid="conversation-panel-wrapper"] .x10l6tqk.x13vifvy.x1o0tod.xh8yej3:not(header *) {
+        mask-image: none !important;
+        background-color: transparent !important;
+        background-image: none !important;
+    }
+    /* the narrow icon bar on the far left */
+    [data-testid="chatlist-header"] {
+        background-color: rgba(29, 31, 31, 0.4) !important;
+    }
+    [data-testid="conversation-header"] {
+        background-color: rgba(22, 23, 23, 0.4) !important;
+    }
+    /* rows of the chat list: the panel behind them already has the glass */
+    [data-testid="cell-frame-container"] {
+        background-color: transparent !important;
+    }
+    [data-testid="chat-info-drawer"] {
+        background-color: rgba(22, 23, 23, 0.3) !important;
+    }
+    /* narrower sidebars: the chat list (30% of the window -> 22%) and the
+       contact info on the right (30% -> 15%) */
+    div:has(> #side) {
+        flex-basis: 22% !important;
+    }
+    /* (only while it's open: closed, it keeps an empty column that pushed
+       the start page off centre) */
+    [data-testid="drawer-right"]:has([data-testid="chat-info-drawer"]) {
+        flex-basis: 15% !important;
+    }
+    /* the layer for panels that slide over the chat list (settings, new
+       chat, ...): same width as the list, so its edge line sits on the list's */
+    [data-testid="drawer-left"] {
+        flex-basis: 22% !important;
+    }
+    /* start page (no chat open) */
+    [data-testid="intro-panel"] {
+        background-color: transparent !important;
+    }
+    /* search bar: one layer of glass around it, like the chat list below
+       (it had two, which stacked into a darker band) */
+    [data-testid="chat-list-search-container"] {
+        background-color: transparent !important;
+    }
+    /* loading screen: the shine moving across the logo */
+    .x1cm6mvd.x13ee8us::after {
+        background-image: none !important;
+    }
+}
+
+
+} /* This is correct, it closes a user.glass.enabled toggle wrapper */

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+
+state_file="${XDG_RUNTIME_DIR:-/tmp}/screen-dimmer.state"
+
+usage() {
+    echo "Usage: $(basename "$0") [1-3|-]" >&2
+    exit 1
+}
+
+toggle_all() {
+    pkill -USR1 -x screen-dimmer
+    if [ "$state" = on ]; then state=off; else state=on; fi
+    echo "$state" > "$state_file"
+}
+
+[ "$#" -le 1 ] || usage
+
+count=$(pgrep -xc screen-dimmer)
+
+# With nothing running, any saved state is stale
+state=off
+if [ "$count" -gt 0 ] && [ -f "$state_file" ]; then
+    state=$(<"$state_file")
+fi
+
+case "${1:-}" in
+    "")
+        target=$(( count > 0 ? count : 1 ))
+        ;;
+    1|2|3)
+        target=$1
+        ;;
+    -)
+        pkill -f screen-dimmer
+        rm -f "$state_file"
+        exit 0
+        ;;
+    *)
+        usage
+        ;;
+esac
+
+if [ "$count" -lt "$target" ]; then
+    new_pids=()
+    for ((i = count; i < target; i++)); do
+        screen-dimmer &
+        new_pids+=("$!")
+    done
+    sleep 0.2
+    if [ "$count" -eq 0 ]; then
+        # Started from nothing: toggle everything on
+        toggle_all
+    elif [ "$state" = on ]; then
+        # Existing ones are dimming: bring only the new ones in line
+        kill -USR1 "${new_pids[@]}"
+    fi
+elif [ "$count" -gt "$target" ]; then
+    # Kill the surplus, highest PIDs first (usually the newest)
+    pgrep -x screen-dimmer | tail -n "$((count - target))" | xargs kill
+else
+    toggle_all
+fi

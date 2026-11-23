@@ -1,0 +1,19 @@
+id = "red/rec-indicator"
+name = "Recording Indicator"
+version = "1.0.2"
+plugin_api = 17
+author = "red"
+license = "MIT"
+icon = "point-filled"
+description = "Red dot and timer in the bar while the capture script is recording."
+tags = ["recording", "capture"]
+
+[[widget]]
+id = "indicator"
+entry = "widget.luau"
+
+[[widget.setting]]
+key = "color"
+type = "color"
+label_key = "settings.color"
+default = "#e53935"

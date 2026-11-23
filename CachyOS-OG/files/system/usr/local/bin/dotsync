@@ -1,0 +1,1483 @@
+#!/usr/bin/env bash
+# dotsync - compare and sync a list of files between your two machines
+#
+#   dotsync                 list of everything that differs (needs fzf):
+#                             Enter  diff, side by side (q goes back)
+#                             Right  what to do with that file (sync, delete,
+#                                    change its rule, ...)
+#                             Tab    mark / unmark a file (→ then acts on all
+#                                    marked ones); Shift+Tab unmarks all,
+#                                    Ctrl+A marks all shown
+#                             Esc    quit, with a short summary
+#   dotsync -n              the same list, read-only (Enter/Right: diff)
+#   dotsync -y              no list: take the suggested action everywhere
+#                           (copy missing files over, newer version wins)
+#   dotsync --plain         ask file by file in the terminal (no fzf)
+#   dotsync --host H        use another machine for this run
+#   dotsync rule PATH...    which rule each path falls under, and why
+#   dotsync rule --set S|D|X PATH...
+#                           give the paths that rule in the list (changes
+#                           their own line, or adds one at the end), then
+#                           commit and push (yazi's "e s" uses this)
+#
+# Before anything else, dotsync checks that both machines run the same
+# dotsync (/usr/local/bin/dotsync, by checksum) and have the same list. If not,
+# that's all it offers to sync, until they match.
+#
+# Config: ~/.config/dotsync/config
+#   MACHINES="@HOSTNAME@ @HOSTNAME@"   the other one is used
+#   NAMES="@HOSTNAME@=PC @HOSTNAME@=Laptop"   short names to show
+#   SSH_USER=red
+#   REPO=~/dev/dotfiles          a git clone holding the list; dotsync pulls it
+#   LIST=dotsync.list            at start, and commits + pushes rule changes
+#   MANIFEST=<url or file>       read-only alternative to REPO
+#
+# The list: one path per line, starting with a letter that says what to do:
+#   S~/.config/yazi/                  S = sync (a folder = everything in it)
+#   D~/.config/niri/config.kdl        D = only show differences, never sync
+#   X*/themes/*                       X = ignore (path, folder or * glob)
+#   S~/.config/mozilla/firefox/*.default-release/chrome/
+#                                     a * in one folder name matches that
+#                                     folder on each machine (Firefox profiles)
+# A line naming one exact file wins over folders and patterns.
+#
+# Which copy is newest: dotsync remembers what it last synced (on both
+# machines, ~/.local/state/dotsync/synced). The side that changed since then
+# is the newest, whatever the file dates say; if both changed, you decide.
+# Never-synced files fall back to the modification dates.
+#
+# Safety: nothing is ever really deleted. Replaced and deleted files are moved
+# to ~/.local/state/dotsync/backups/<date>/ on that machine. Files outside
+# your home need sudo; the password prompt names the machine it's for.
+
+set -uo pipefail
+
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/dotsync/config
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/dotsync
+SYNCDB_REL=.local/state/dotsync/synced
+STAMP=${DOTSYNC_STAMP:-$(date +%Y-%m-%d_%H-%M-%S)}
+BACKUP_REL=".local/state/dotsync/backups/$STAMP"
+SUDO_PROMPT='[sudo] password for %u on %h: '
+
+# colours: always inside fzf (DOTSYNC_TMP set), else only on a terminal
+if [ -t 1 ] || [ -n "${DOTSYNC_TMP-}" ]; then
+    B=$'\e[1m' D=$'\e[2m' R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' N=$'\e[0m'
+else
+    B= D= R= G= Y= C= N=
+fi
+die() { echo "${R}dotsync:${N} $*" >&2; exit 1; }
+pause() { read -r -p "${D}Press Enter to continue${N}" _ </dev/tty; }
+
+# =================================================================================
+# Shared pieces (used by the main run and by the parts fzf calls back into)
+# =================================================================================
+
+# Turn a list path into a real one: ~ -> home, and a * in one folder name
+# -> the first folder on this machine that matches (rest of the path kept).
+RESOLVE_FN=$(cat <<'EOF'
+resolve() {
+    local p=$1 pre after comp rest match
+    case $p in "~"|"~/"*) p=$HOME${p#\~} ;; esac
+    if [[ $p == *"*"* ]]; then
+        pre=${p%%\**}; after=${p#*\*}
+        comp=${after%%/*}; rest=${after#"$comp"}
+        match=$(compgen -G "$pre*$comp" | head -n 1)
+        [ -n "$match" ] && p=$match$rest
+    fi
+    printf "%s\n" "$p"
+}
+EOF
+)
+eval "$RESOLVE_FN"
+
+# Status of files on one machine. Reads list paths on stdin; prints
+# path<TAB>mtime<TAB>sha256<TAB>mode<TAB>size<TAB>real path<TAB>link target<TAB>target ok
+# for every file. A symlink is listed as itself: mode "l", its checksum made
+# from where it points, never from the file behind it.
+STAT_SCRIPT="$RESOLVE_FN"'
+one() {   # LISTPATH REALPATH
+    local t ok=ok
+    if [ -L "$2" ]; then
+        t=$(readlink -- "$2"); [ -e "$2" ] || ok=missing
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$1" "$(stat -c %Y -- "$2")" "$(printf "link:%s" "$t" | sha256sum | cut -d" " -f1)" l 0 "$2" "$t" "$ok"
+    else
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t\t\n" "$1" "$(stat -c %Y -- "$2")" "$(sha256sum < "$2" | cut -d" " -f1)" "$(stat -c %a -- "$2")" "$(stat -c %s -- "$2")" "$2"
+    fi
+}
+while IFS= read -r entry; do
+    real=$(resolve "$entry")
+    # a folder (ending in / in the list: even if the folder itself is a link)
+    if [ -d "$real" ] && { [ "${entry%/}" != "$entry" ] || [ ! -L "$real" ]; }; then
+        base=${entry%/}; rbase=${real%/}
+        find "$rbase/" \( -type f -o -type l \) 2>/dev/null | sort | while IFS= read -r f; do
+            one "$base${f#"$rbase"}" "$f"
+        done
+    elif [ -L "${real%/}" ]; then
+        one "${entry%/}" "${real%/}"
+    elif [ -f "$real" ]; then
+        one "$entry" "$real"
+    fi
+done'
+
+# Remember / forget what was synced: db_set PATH SUM, db_del PATH
+DB_SCRIPT='
+db=$HOME/'"$SYNCDB_REL"'; mkdir -p "$(dirname "$db")"; touch "$db"
+tmp=$(mktemp)
+awk -F"\t" -v p="$2" "\$1 != p" "$db" > "$tmp"
+[ "$1" = set ] && printf "%s\t%s\n" "$2" "$3" >> "$tmp"
+cat "$tmp" > "$db"; rm -f "$tmp"'
+
+ssh_setup() {   # HOST and SOCK must be set
+    # give up after 10 s on connecting, and after 15 s of silence mid-run
+    SSHOPT=(-o ControlMaster=auto -o "ControlPath=$SOCK" -o ControlPersist=900
+            -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
+}
+rssh() { ssh "${SSHOPT[@]}" "$HOST" "$@"; }
+
+# ---------- progress (on the terminal, through stderr) -----------------------------
+PROGRESS=0; [ -t 2 ] && PROGRESS=1
+SCPQ=(-q)                                  # scp's progress bar: only where it's useful
+since() {   # T0 (an $EPOCHREALTIME) -> "1.4 s"
+    local a=${1//[!0-9]/} b=${EPOCHREALTIME//[!0-9]/} d
+    d=$(( (b - a) / 100000 )); printf '%d.%d s' $(( d / 10 )) $(( d % 10 ))
+}
+# spin LABEL VAR CMD...: run CMD, showing LABEL, a spinner and the seconds;
+# its output goes into VAR. Not for anything that may ask for a password.
+spin() {
+    local label=$1 __var=$2; shift 2
+    local out=$TMP/spin.out t0=$EPOCHREALTIME i=0 pid rc fr=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+    "$@" > "$out" 2> "$TMP/spin.err" &
+    pid=$!
+    if (( PROGRESS )); then
+        while kill -0 "$pid" 2>/dev/null; do
+            printf '\r\e[K%s %s %s' "$(pad 34 "$label")" "${fr[i++ % 10]}" "$(since "$t0")" >&2
+            sleep 0.1
+        done
+    fi
+    wait "$pid"; rc=$?
+    printf -v "$__var" '%s' "$(cat "$out")"
+    STEP_LABEL=$label STEP_T0=$t0
+    return $rc
+}
+step_done() { (( PROGRESS )) && printf '\r\e[K%s %s%s%s  %s%s%s\n' "$(pad 34 "$STEP_LABEL")" "${2:-$G}" "$1" "$N" "$D" "$(since "$STEP_T0")" "$N" >&2; return 0; }
+say() { (( PROGRESS )) && printf '%s\n' "$*" >&2; return 0; }
+# Run a bash SCRIPT with ARGS on the other machine. Its login shell may be
+# fish, so the script travels base64-encoded inside single quotes, which both
+# shells read the same way. -t first: give it a terminal (for sudo).
+rrun() {
+    local tty=() script full b64
+    [ "${1-}" = -t ] && { tty=(-t); shift; }
+    script=$1; shift
+    full="set --"
+    [ $# -gt 0 ] && full+=" $(printf '%q ' "$@")"
+    full+=$'\n'"$script"
+    b64=$(printf '%s' "$full" | base64 -w0)
+    # (with -t, ssh's input must be the terminal, or ssh won't make one and
+    # sudo there can't ask for the password: in a group action the input is
+    # the list of files, so read from the terminal itself)
+    if [ ${#tty[@]} -gt 0 ] && [ ! -t 0 ] && { : < /dev/tty; } 2>/dev/null; then
+        ssh "${SSHOPT[@]}" "${tty[@]}" "$HOST" "bash -c 'eval \"\$(echo $b64 | base64 -d)\"'" < /dev/tty
+    else
+        ssh "${SSHOPT[@]}" "${tty[@]}" "$HOST" "bash -c 'eval \"\$(echo $b64 | base64 -d)\"'"
+    fi
+}
+
+human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1}B"; }
+perm_str() {   # 755 -> rwxr-xr-x
+    local m=$1 out="" d k
+    for (( k = ${#m} - 3; k < ${#m}; k++ )); do
+        d=${m:k:1}; out+=$(( d & 4 ))$(( d & 2 ))$(( d & 1 ))
+    done
+    out=${out//4/r}; out=${out//2/w}; out=${out//1/x}; out=${out//0/-}
+    printf '%s' "$out"
+}
+pad() {   # WIDTH TEXT: left-aligned, padded by characters (not bytes)
+    local n=$(( $1 - ${#2} )); (( n < 0 )) && n=0
+    printf '%s%*s' "$2" "$n" ''
+}
+center() {   # WIDTH TEXT
+    local w=$1 t=$2 l r
+    l=$(( (w - ${#t}) / 2 )); r=$(( w - ${#t} - l )); (( l < 0 )) && l=0; (( r < 0 )) && r=0
+    printf '%*s%s%*s' "$l" '' "$t" "$r" ''
+}
+shorten() {   # MAX PATH: cut the middle out of long paths
+    local max=$1 p=$2 keep_l keep_r
+    (( ${#p} <= max )) && { printf '%s' "$p"; return; }
+    keep_r=$(( (max - 1) * 3 / 5 )); keep_l=$(( max - 1 - keep_r ))
+    printf '%s…%s' "${p:0:keep_l}" "${p: -keep_r}"
+}
+pid_of() { printf '%s' "$1" | md5sum | cut -c1-12; }
+local_path() { resolve "$1"; }
+short_time() { date -d "@$1" '+%H:%M %d.%m.%y'; }
+label_of() {   # hostname -> short name from NAMES (or the hostname)
+    local h=${1,,} pair
+    for pair in $NAMES; do [ "${pair%%=*}" = "$h" ] && { echo "${pair#*=}"; return; }; done
+    echo "$1"
+}
+
+# ---------- the rules (from the list) ----------------------------------------------
+declare -A EXACT=()      # path -> S/D/X for lines naming one exact file
+ENTRIES=() S_ENTRIES=() D_ENTRIES=() X_ENTRIES=()
+load_rules() {   # FILE
+    local line n=0 op path
+    while IFS= read -r line; do
+        n=$((n + 1))
+        line=${line%$'\r'}
+        line=${line#"${line%%[![:space:]]*}"}; line=${line%"${line##*[![:space:]]}"}
+        [[ -z $line || $line == \#* ]] && continue
+        op=${line:0:1} path=${line:1}
+        path=${path#"${path%%[![:space:]]*}"}
+        [ -n "$path" ] || continue
+        case ${op^^} in
+            S) S_ENTRIES+=("$path"); ENTRIES+=("$path") ;;
+            D) D_ENTRIES+=("$path"); ENTRIES+=("$path") ;;
+            X) X_ENTRIES+=("$path") ;;
+            *) [ -z "${DOTSYNC_TMP-}" ] && echo "${Y}dotsync:${N} list line $n starts with '$op' (not S, D or X), skipped" >&2; continue ;;
+        esac
+        # an exact file (no trailing /, no *) gets the highest priority
+        [[ $path != */ && $path != *"*"* ]] && EXACT[$path]=${op^^}
+    done < "$1"
+}
+covers() {   # PATTERN PATH: a folder entry covers what's below, * matches anything
+    # shellcheck disable=SC2053
+    [[ $2 == $1 ]] || [[ $2 == "${1%/}/"* ]]
+}
+rule_of() {   # PATH -> S, D or X
+    local p=$1 e
+    [ -n "${EXACT[$p]-}" ] && { echo "${EXACT[$p]}"; return; }
+    for e in "${X_ENTRIES[@]}"; do covers "$e" "$p" && { echo X; return; }; done
+    for e in "${D_ENTRIES[@]}"; do covers "$e" "$p" && { echo D; return; }; done
+    echo S
+}
+
+# why_rule PATH -> "S|D|X|-<TAB>reason" ("-": not in the list at all)
+why_rule() {
+    local p=$1 e
+    if [ -n "${EXACT[$p]-}" ]; then printf '%s\tits own line %s%s\n' "${EXACT[$p]}" "${EXACT[$p]}" "$p"; return; fi
+    for e in "${X_ENTRIES[@]}"; do [ "$e" = "$p" ] && { printf 'X\tits own line X%s\n' "$e"; return; }; done
+    for e in "${D_ENTRIES[@]}"; do [ "$e" = "$p" ] && { printf 'D\tits own line D%s\n' "$e"; return; }; done
+    for e in "${S_ENTRIES[@]}"; do [ "$e" = "$p" ] && { printf 'S\tits own line S%s\n' "$e"; return; }; done
+    for e in "${X_ENTRIES[@]}"; do covers "$e" "$p" && { printf 'X\tcovered by X%s\n' "$e"; return; }; done
+    for e in "${D_ENTRIES[@]}"; do covers "$e" "$p" && { printf 'D\tcovered by D%s\n' "$e"; return; }; done
+    for e in "${S_ENTRIES[@]}"; do covers "$e" "$p" && { printf 'S\tcovered by S%s\n' "$e"; return; }; done
+    printf -- '-\tnot in the list\n'
+}
+# to_list_path PATH: an absolute path as the list writes it: ~ for home, a
+# trailing / for folders, and the Firefox profile folder as its * pattern
+to_list_path() {
+    local p=$1 e pre after comp pat real
+    p=$(realpath -s -- "$p" 2>/dev/null || printf '%s' "$p")
+    for e in "${S_ENTRIES[@]}" "${D_ENTRIES[@]}" "${X_ENTRIES[@]}"; do
+        [[ $e == *"*"* ]] || continue
+        pre=${e%%\**}; after=${e#*\*}; comp=${after%%/*}; pat=$pre*$comp
+        [[ $pat == *"*"*"*"* ]] && continue      # only one * in a folder name
+        real=$(resolve "$pat"); [[ $real == *"*"* ]] && continue
+        if [ "$p" = "$real" ] || [[ $p == "$real"/* ]]; then p=$pat${p#"$real"}; break; fi
+    done
+    case $p in "$HOME") p="~" ;; "$HOME"/*) p="~${p#"$HOME"}" ;; esac
+    [ -d "$1" ] && [ ! -L "$1" ] && [[ $p != */ ]] && p+=/
+    printf '%s\n' "$p"
+}
+
+# ---------- scanning both machines ------------------------------------------------
+declare -A L_MT L_SUM L_MODE L_SIZE L_REAL R_MT R_SUM R_MODE R_SIZE R_REAL SEEN DB L_LINK R_LINK L_LOK R_LOK
+ORDER=()
+scan() {
+    local p mt sum mode size real link lok
+    L_MT=() L_SUM=() L_MODE=() L_SIZE=() L_REAL=() R_MT=() R_SUM=() R_MODE=() R_SIZE=() R_REAL=() SEEN=() ORDER=() DB=()
+    L_LINK=() R_LINK=() L_LOK=() R_LOK=()
+    # the first scan of a run shows how far it got (DOTSYNC_PROGRESS)
+    local show=0 n=0 t0 label; [ "${DOTSYNC_PROGRESS-}" = 1 ] && (( PROGRESS )) && show=1
+    t0=$EPOCHREALTIME label="Scanning ${HERE_L:-here}…"
+    while IFS=$'\t' read -r p mt sum mode size real link lok; do
+        L_MT[$p]=$mt L_SUM[$p]=$sum L_MODE[$p]=$mode L_SIZE[$p]=$size L_REAL[$p]=$real L_LINK[$p]=$link L_LOK[$p]=$lok
+        [ -n "${SEEN[$p]-}" ] || { SEEN[$p]=1; ORDER+=("$p"); }
+        n=$((n + 1)); (( show && n % 5 == 0 )) && printf '\r\e[K%s %d files  %s' "$(pad 34 "$label")" "$n" "$(since "$t0")" >&2
+    done < <(printf '%s\n' "${ENTRIES[@]}" | bash -c "$STAT_SCRIPT")
+    (( show )) && { STEP_LABEL=$label STEP_T0=$t0; step_done "$n files"; }
+    n=0 t0=$EPOCHREALTIME label="Scanning ${THERE_L:-the other machine}…"
+    (( show )) && printf '%s' "$(pad 34 "$label")" >&2
+    while IFS=$'\t' read -r p mt sum mode size real link lok; do
+        R_MT[$p]=$mt R_SUM[$p]=$sum R_MODE[$p]=$mode R_SIZE[$p]=$size R_REAL[$p]=$real R_LINK[$p]=$link R_LOK[$p]=$lok
+        [ -n "${SEEN[$p]-}" ] || { SEEN[$p]=1; ORDER+=("$p"); }
+        n=$((n + 1)); (( show && n % 5 == 0 )) && printf '\r\e[K%s %d files  %s' "$(pad 34 "$label")" "$n" "$(since "$t0")" >&2
+    done < <(printf '%s\n' "${ENTRIES[@]}" | rrun "$STAT_SCRIPT")
+    (( show )) && { STEP_LABEL=$label STEP_T0=$t0; step_done "$n files"; }
+    if [ -r "$HOME/$SYNCDB_REL" ]; then
+        while IFS=$'\t' read -r p sum; do [ -n "$p" ] && DB[$p]=$sum; done < "$HOME/$SYNCDB_REL"
+    fi
+}
+
+# kind_of PATH -> same | only_here | only_there | differs
+kind_of() {
+    local p=$1
+    if [ -n "${L_MT[$p]-}" ] && [ -n "${R_MT[$p]-}" ]; then
+        [ "${L_SUM[$p]}" = "${R_SUM[$p]}" ] && echo same || echo differs
+    elif [ -n "${L_MT[$p]-}" ]; then echo only_here
+    else echo only_there; fi
+}
+# newest_of PATH -> here | there | both (changed on both sides since the last sync)
+newest_of() {
+    local p=$1 last
+    case $(kind_of "$p") in only_here) echo here; return ;; only_there) echo there; return ;; esac
+    last=${DB[$p]-}
+    if [ -n "$last" ]; then
+        if [ "${L_SUM[$p]}" = "$last" ] && [ "${R_SUM[$p]}" != "$last" ]; then echo there; return; fi
+        if [ "${R_SUM[$p]}" = "$last" ] && [ "${L_SUM[$p]}" != "$last" ]; then echo here; return; fi
+        echo both; return
+    fi
+    (( ${L_MT[$p]} >= ${R_MT[$p]} )) && echo here || echo there
+}
+# suggest PATH -> send | pull | diff | ignore | decide
+suggest() {
+    local p=$1
+    case $(rule_of "$p") in D) echo diff; return ;; X) echo ignore; return ;; esac
+    case $(newest_of "$p") in here) echo send ;; there) echo pull ;; both) echo decide ;; esac
+}
+
+# ---------- copying, deleting, remembering --------------------------------------------
+install_here() {   # SRC DEST MODE MTIME: install a temp file locally, backing up the old one
+    local src=$1 dest=$2 mode=$3 mtime=$4 sudo=() bdir
+    [[ $dest == *"*"* ]] && { echo "no folder matching $dest on $HERE" >&2; return 1; }
+    if ! { mkdir -p -- "$(dirname -- "$dest")" 2>/dev/null && { [ ! -e "$dest" ] || [ -w "$dest" ]; } && [ -w "$(dirname -- "$dest")" ]; }; then
+        sudo=(sudo -p "$SUDO_PROMPT")
+    fi
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        bdir=$HOME/$BACKUP_REL$(dirname -- "$dest")
+        mkdir -p -- "$bdir" && "${sudo[@]}" cp -P -p -- "$dest" "$bdir/" || return 1
+    fi
+    "${sudo[@]}" install -D -m "$mode" -- "$src" "$dest" && "${sudo[@]}" touch -d "@$mtime" -- "$dest"
+}
+
+REMOTE_INSTALL='
+src=$1 entry=$2 mode=$3 mtime=$4 backup=$5 prompt=$6
+dest=$(resolve "$entry")
+case $dest in *"*"*) echo "no folder matching $entry" >&2; rm -f -- "$src"; exit 1 ;; esac
+sudo=()
+if ! { mkdir -p -- "$(dirname -- "$dest")" 2>/dev/null && { [ ! -e "$dest" ] || [ -w "$dest" ]; } && [ -w "$(dirname -- "$dest")" ]; }; then sudo=(sudo -p "$prompt"); fi
+if [ -e "$dest" ] || [ -L "$dest" ]; then
+    bdir=$HOME/$backup$(dirname -- "$dest")
+    mkdir -p -- "$bdir" && "${sudo[@]}" cp -P -p -- "$dest" "$bdir/" || exit 1
+fi
+"${sudo[@]}" install -D -m "$mode" -- "$src" "$dest" && "${sudo[@]}" touch -d "@$mtime" -- "$dest"
+rc=$?; rm -f -- "$src"; exit $rc'
+
+install_there() {   # SRC PATH MODE MTIME
+    local src=$1 path=$2 mode=$3 mtime=$4 rtmp
+    rtmp=$(rrun 'mktemp') || return 1
+    scp "${SCPQ[@]}" "${SSHOPT[@]}" -- "$src" "$HOST:$rtmp" || return 1
+    rrun -t "$RESOLVE_FN"$'\n'"$REMOTE_INSTALL" "$rtmp" "$path" "$mode" "$mtime" "$BACKUP_REL" "$SUDO_PROMPT" 2>/dev/null
+}
+
+fetch_there() {   # PATH OUT: the other machine's copy to a local file
+    local path=$1 out=$2 rpath=${R_REAL[$1]-}
+    [ -n "$rpath" ] || rpath=$(rrun "$RESOLVE_FN"$'\n''resolve "$1"' "$path") || return 1
+    [[ $rpath == *"*"* ]] && return 1
+    scp "${SCPQ[@]}" "${SSHOPT[@]}" -- "$HOST:$rpath" "$out" 2>/dev/null \
+        || scp "${SCPQ[@]}" "${SSHOPT[@]}" -- "$HOST:$(printf %q "$rpath")" "$out"
+}
+
+REMOTE_DELETE='
+entry=$1 backup=$2 prompt=$3
+dest=$(resolve "$entry"); [ -e "$dest" ] || [ -L "$dest" ] || exit 1
+sudo=(); [ -w "$(dirname -- "$dest")" ] || sudo=(sudo -p "$prompt")
+bdir=$HOME/$backup$(dirname -- "$dest")
+mkdir -p -- "$bdir" && "${sudo[@]}" mv -- "$dest" "$bdir/"'
+
+delete_here() {   # PATH: move to the backup folder
+    local dest; dest=$(local_path "$1")
+    [ -e "$dest" ] || [ -L "$dest" ] || return 1
+    local sudo=(); [ -w "$(dirname -- "$dest")" ] || sudo=(sudo -p "$SUDO_PROMPT")
+    local bdir=$HOME/$BACKUP_REL$(dirname -- "$dest")
+    mkdir -p -- "$bdir" && "${sudo[@]}" mv -- "$dest" "$bdir/"
+}
+delete_there() { rrun -t "$RESOLVE_FN"$'\n'"$REMOTE_DELETE" "$1" "$BACKUP_REL" "$SUDO_PROMPT" 2>/dev/null; }
+
+# Put a deleted file back: BACKUP (relative to that machine's home) -> DEST.
+# Refuses if something is at DEST again.
+REMOTE_RESTORE='
+backup=$HOME/$1 dest=$2 prompt=$3
+[ -e "$backup" ] || [ -L "$backup" ] || { echo "the backup is gone: $backup" >&2; exit 1; }
+{ [ -e "$dest" ] || [ -L "$dest" ]; } && { echo "a file is at $dest again, left it alone" >&2; exit 1; }
+sudo=(); mkdir -p -- "$(dirname -- "$dest")" 2>/dev/null && [ -w "$(dirname -- "$dest")" ] || sudo=(sudo -p "$prompt")
+"${sudo[@]}" mkdir -p -- "$(dirname -- "$dest")" && "${sudo[@]}" mv -- "$backup" "$dest"'
+restore_here() { bash -c "$REMOTE_RESTORE" _ "$1" "$2" "$SUDO_PROMPT"; }
+restore_there() { rrun -t "$REMOTE_RESTORE" "$1" "$2" "$SUDO_PROMPT"; }
+
+remember() {   # PATH SUM: on both machines
+    bash -c "$DB_SCRIPT" _ set "$1" "$2"
+    rrun "$DB_SCRIPT" set "$1" "$2"
+}
+forget() { bash -c "$DB_SCRIPT" _ del "$1"; rrun "$DB_SCRIPT" del "$1"; }
+
+# Make a symlink: TARGET LISTPATH MTIME BACKUP PROMPT. Whatever is at that name
+# goes to the backup folder first; a real folder there is left alone.
+LINK_SCRIPT='
+target=$1 entry=$2 mtime=$3 backup=$4 prompt=$5
+dest=$(resolve "$entry")
+case $dest in *"*"*) echo "no folder matching $entry" >&2; exit 1 ;; esac
+[ -d "$dest" ] && [ ! -L "$dest" ] && { echo "$dest is a folder, not replacing it with a link" >&2; exit 1; }
+sudo=()
+if ! { mkdir -p -- "$(dirname -- "$dest")" 2>/dev/null && [ -w "$(dirname -- "$dest")" ]; }; then sudo=(sudo -p "$prompt"); fi
+if [ -e "$dest" ] || [ -L "$dest" ]; then
+    bdir=$HOME/$backup$(dirname -- "$dest")
+    mkdir -p -- "$bdir" && "${sudo[@]}" cp -P -p -- "$dest" "$bdir/" || exit 1
+fi
+"${sudo[@]}" mkdir -p -- "$(dirname -- "$dest")" &&
+"${sudo[@]}" ln -sfn -- "$target" "$dest" && "${sudo[@]}" touch -h -d "@$mtime" -- "$dest"'
+link_here()  { bash -c "$RESOLVE_FN"$'\n'"$LINK_SCRIPT" _ "$1" "$2" "$3" "$BACKUP_REL" "$SUDO_PROMPT"; }
+link_there() { rrun -t "$RESOLVE_FN"$'\n'"$LINK_SCRIPT" "$1" "$2" "$3" "$BACKUP_REL" "$SUDO_PROMPT" 2>/dev/null; }
+
+# Several operations in one go, so sudo asks once per machine. OPSFILE has one
+# operation per line, fields split by \x1f:
+#   ID install SRC LISTPATH MODE MTIME     (SRC: a temp file, removed after)
+#   ID link    TARGET LISTPATH MTIME
+#   ID delete  LISTPATH                    (moved to the backup folder)
+#   ID restore BACKUP DEST                 (BACKUP relative to home)
+# RESFILE gets "ID<TAB>ok" or "ID<TAB>fail<TAB>message" per line.
+OPS_SCRIPT='
+ops=$1 res=$2 backup=$3 prompt=$4
+: > "$res"
+S() { if [ "$need" = 1 ]; then sudo -p "$prompt" "$@"; else "$@"; fi; }
+nosudo() {   # DEST: can we write it without sudo?
+    mkdir -p -- "$(dirname -- "$1")" 2>/dev/null && [ -w "$(dirname -- "$1")" ] &&
+        { [ ! -e "$1" ] || [ -L "$1" ] || [ -w "$1" ]; }
+}
+keep_old() {   # DEST: copy what is there now into the backup folder
+    if [ -e "$1" ] || [ -L "$1" ]; then
+        local b=$HOME/$backup$(dirname -- "$1")
+        mkdir -p -- "$b" && S cp -P -p -- "$1" "$b/"
+    fi
+}
+op_install() {
+    local src=$1 dest need=0 rc
+    dest=$(resolve "$2")
+    case $dest in *"*"*) echo "no folder matching $2"; rm -f -- "$src"; return 1 ;; esac
+    nosudo "$dest" || need=1
+    keep_old "$dest" || { rm -f -- "$src"; return 1; }
+    S install -D -m "$3" -- "$src" "$dest" && S touch -d "@$4" -- "$dest"
+    rc=$?; rm -f -- "$src"; return $rc
+}
+op_link() {
+    local dest need=0
+    dest=$(resolve "$2")
+    case $dest in *"*"*) echo "no folder matching $2"; return 1 ;; esac
+    [ -d "$dest" ] && [ ! -L "$dest" ] && { echo "$dest is a folder, not replacing it with a link"; return 1; }
+    nosudo "$dest" || need=1
+    keep_old "$dest" || return 1
+    S mkdir -p -- "$(dirname -- "$dest")" && S ln -sfn -- "$1" "$dest" && S touch -h -d "@$3" -- "$dest"
+}
+op_delete() {
+    local dest need=0 b
+    dest=$(resolve "$1")
+    [ -e "$dest" ] || [ -L "$dest" ] || { echo "not there anymore"; return 1; }
+    [ -w "$(dirname -- "$dest")" ] || need=1
+    b=$HOME/$backup$(dirname -- "$dest")
+    mkdir -p -- "$b" && S mv -- "$dest" "$b/"
+}
+op_restore() {
+    local bk=$HOME/$1 dest=$2 need=0
+    [ -e "$bk" ] || [ -L "$bk" ] || { echo "the backup is gone: $bk"; return 1; }
+    { [ -e "$dest" ] || [ -L "$dest" ]; } && { echo "a file is at $dest again, left it alone"; return 1; }
+    nosudo "$dest" || need=1
+    S mkdir -p -- "$(dirname -- "$dest")" && S mv -- "$bk" "$dest"
+}
+while IFS=$'"'"'\x1f'"'"' read -r id op a b c d; do
+    msg=$("op_$op" "$a" "$b" "$c" "$d" 2>&1)
+    if [ $? -eq 0 ]; then printf "%s\tok\n" "$id" >> "$res"
+    else printf "%s\tfail\t%s\n" "$id" "$(printf %s "$msg" | tr "\n\t" "  ")" >> "$res"; fi
+done < "$ops"'
+
+ops_here() {   # OPSFILE RESFILE
+    bash -c "$RESOLVE_FN"$'\n'"$OPS_SCRIPT" _ "$1" "$2" "$BACKUP_REL" "$SUDO_PROMPT"
+}
+ops_there() {   # OPSFILE RESFILE (the ops file's SRC paths already point at the other machine)
+    local rops rres
+    rops=$(rrun 'mktemp') && rres=$(rrun 'mktemp') || return 1
+    scp -q "${SSHOPT[@]}" -- "$1" "$HOST:$rops" || return 1
+    rrun -t "$RESOLVE_FN"$'\n'"$OPS_SCRIPT" "$rops" "$rres" "$BACKUP_REL" "$SUDO_PROMPT"
+    rrun 'cat -- "$1"; rm -f -- "$1" "$2"' "$rres" "$rops" > "$2"
+}
+
+do_send() {   # PATH
+    local p=$1
+    say "${D}Sending to $THERE_L${N}  $p"
+    if [ "${L_MODE[$p]-}" = l ]; then
+        link_there "${L_LINK[$p]}" "$p" "${L_MT[$p]}" && remember "$p" "${L_SUM[$p]}"; return
+    fi
+    install_there "$(local_path "$p")" "$p" "${L_MODE[$p]}" "${L_MT[$p]}" && remember "$p" "${L_SUM[$p]}"
+}
+do_pull() {   # PATH [COPY]
+    local p=$1 copy=${2-}
+    say "${D}Getting from $THERE_L${N}  $p"
+    if [ "${R_MODE[$p]-}" = l ]; then
+        link_here "${R_LINK[$p]}" "$p" "${R_MT[$p]}" && remember "$p" "${R_SUM[$p]}"; return
+    fi
+    if [ -z "$copy" ] || [ ! -s "$copy" ]; then copy=$(mktemp); fetch_there "$p" "$copy" || return 1; fi
+    install_here "$copy" "$(local_path "$p")" "${R_MODE[$p]}" "${R_MT[$p]}" && remember "$p" "${R_SUM[$p]}"
+}
+
+# ---------- the git repo holding the list ---------------------------------------------
+# edit_rule PATH LETTER: change or add the line for PATH in the repo's list
+edit_rule() {
+    local p=$1 l=$2 file=$REPO_DIR/$LIST num
+    num=$(awk -v p="$p" '{ s = $0; sub(/^[[:space:]]+/, "", s); r = substr(s, 2); sub(/^[[:space:]]+/, "", r); sub(/[[:space:]]+$/, "", r);
+                           if (s !~ /^#/ && r == p) { print NR; exit } }' "$file")
+    if [ -n "$num" ]; then
+        sed -i "${num}s/^\([[:space:]]*\)./\1$l/" "$file"
+    else
+        grep -qx '# ---- changed from dotsync ----' "$file" || printf '\n# ---- changed from dotsync ----\n' >> "$file"
+        printf '%s%s\n' "$l" "$p" >> "$file"
+    fi
+}
+# commit_rules MESSAGE: commit and push the list (git's messages go to a log,
+# shown only if something fails)
+commit_rules() {
+    { git -C "$REPO_DIR" add -- "$LIST" &&
+      git -C "$REPO_DIR" commit -q -m "$1" -- "$LIST" &&
+      git -C "$REPO_DIR" push -q; } > "$TMP/git.log" 2>&1
+}
+word_of() { case $1 in S) echo SYNC ;; D) echo DIFF ;; X) echo IGNORE ;; esac; }
+set_rule() {   # PATH LETTER: one file, its own commit
+    edit_rule "$1" "$2" && commit_rules "dotsync: $1 → $(word_of "$2")"
+}
+rules_failed() {
+    cat "$TMP/git.log"
+    echo "${R}Couldn't commit or push the change.${N} The list in $REPO_DIR may be changed but not pushed."
+    pause
+}
+
+# =================================================================================
+# The interactive list: fzf calls back into this script for each part
+# =================================================================================
+
+load_env() {   # inside fzf: everything comes from the environment and DOTSYNC_TMP
+    TMP=$DOTSYNC_TMP HOST=$DOTSYNC_HOST SOCK=$DOTSYNC_SOCK
+    HERE=$DOTSYNC_HERE THERE=$DOTSYNC_THERE HERE_L=$DOTSYNC_HERE_L THERE_L=$DOTSYNC_THERE_L
+    DRY=$DOTSYNC_DRY REPO_DIR=${DOTSYNC_REPO-} LIST=${DOTSYNC_LIST-}
+    ssh_setup
+    load_rules "$TMP/rules"
+}
+
+# the list as fzf shows it; first line is the header (--header-lines=1)
+list_cmd() {
+    scan
+    local p kind rule sug newest target reason mark state st_sum id line
+    local n_same=0 n_diff=0 n_ign=0 n_changed=0 n_left=0 n_failed=0
+    local lines=() ignored=() wl wp=55 order=() out
+    local -A inord=()
+    wl=$(( ${#HERE_L} > ${#THERE_L} ? ${#HERE_L} : ${#THERE_L} )); (( wl < 7 )) && wl=7; wl=$((wl + 2))
+    # keep the order of the first scan, so rows don't move (deleted ones stay too)
+    if [ -r "$TMP/order" ]; then while IFS= read -r p; do order+=("$p"); inord[$p]=1; done < "$TMP/order"; fi
+    for p in "${ORDER[@]}"; do [ -n "${inord[$p]-}" ] || { order+=("$p"); inord[$p]=1; }; done
+    printf '%s\n' "${order[@]}" > "$TMP/order"
+    for p in "${order[@]}"; do
+        id=$(pid_of "$p") rule=$(rule_of "$p")
+        read_state "$p"; state=$ST_STATE st_sum=$ST_SUM
+        if [ -z "${SEEN[$p]-}" ]; then
+            # gone from both machines: only deleted files are still shown
+            [ "$state" = deleted ] || continue
+            [ "$ST_FROM" = here ] && newest=$HERE_L || newest=$THERE_L
+            n_changed=$((n_changed + 1))
+            line=$(printf '%s\t%s✓%s %s%s%s %s→%s %s%s%s  %s  %s(deleted, → restores)%s' "$id" "$G" "$N" \
+                "$B" "$(center "$wl" "[$newest]")" "$N" "$D" "$N" "$R" "$(center "$wl" "[deleted]")" "$N" \
+                "$(pad "$wp" "$(shorten "$wp" "$p")")" "$D" "$N")
+            if [ "$rule" = X ]; then ignored+=("$line"); else lines+=("$line"); fi
+            continue
+        fi
+        [ "$state" = deleted ] && state=""   # it's back
+        kind=$(kind_of "$p")
+        if [ "$kind" = same ]; then
+            if [ "$rule" = X ]; then n_ign=$((n_ign + 1)); else n_same=$((n_same + 1)); fi
+            # synced this run: keep it in the list with a ✓
+            case $state in sent|pulled) ;; *) continue ;; esac
+        fi
+        # a file that changed again after being handled is pending again
+        if [ -n "$state" ] && [ "$kind" != same ]; then
+            [ "${L_SUM[$p]-}:${R_SUM[$p]-}" = "$st_sum" ] || state=""
+        fi
+        [ "$rule" = X ] && [ "$kind" != same ] && n_ign=$((n_ign + 1))
+        [ "$rule" != X ] && [ "$kind" != same ] && n_diff=$((n_diff + 1))
+
+        sug=$(suggest "$p")
+        case $kind in
+            only_here) newest=$HERE_L reason=missing ;;
+            only_there) newest=$THERE_L reason=missing ;;
+            *) case $(newest_of "$p") in here) newest=$HERE_L ;; there) newest=$THERE_L ;; both) newest="?" ;; esac
+               reason=outdated ;;
+        esac
+        case $sug in
+            send) target=$THERE_L ;; pull) target=$HERE_L ;;
+            diff) target=diff ;; ignore) target=ignore ;; decide) target="?"; reason="both changed" ;;
+        esac
+        case $state in sent) newest=$HERE_L target=$THERE_L ;; pulled) newest=$THERE_L target=$HERE_L ;; esac
+        case $state in
+            sent|pulled) mark="${G}✓${N} " reason=synced; n_changed=$((n_changed + 1)) ;;
+            kept)    mark="${D}·${N} " reason="left as is" ;;
+            failed)  mark="${R}✗${N} " reason=failed; n_failed=$((n_failed + 1)) ;;
+            *)       mark="  " ;;
+        esac
+        [ "$rule" != X ] && [ "$kind" != same ] && case $state in sent|pulled|failed) ;; *) n_left=$((n_left + 1)) ;; esac
+        if is_link "$p"; then
+            if [ "${L_LOK[$p]-}" = missing ] || [ "${R_LOK[$p]-}" = missing ]; then reason="$reason, link to a missing file"
+            else reason="$reason, link"; fi
+        fi
+        local scol=$B tcol=$G pcol=""
+        [ "$target" = diff ] && tcol=$C
+        [ "$target" = "?" ] && tcol=$Y
+        if [ "$rule" = X ] && [ -z "$state" ]; then scol=$D tcol=$D pcol=$D; fi
+        line=$(printf '%s\t%s%s%s%s %s→%s %s%s%s  %s%s%s  %s(%s)%s' "$id" "$mark" \
+            "$scol" "$(center "$wl" "[$newest]")" "$N" "$D" "$N" "$tcol" "$(center "$wl" "[$target]")" "$N" \
+            "$pcol" "$(pad "$wp" "$(shorten "$wp" "$p")")" "$N" "$D" "$reason" "$N")
+        if [ "$rule" = X ]; then ignored+=("$line"); else lines+=("$line"); fi
+    done
+    local note
+    (( DRY )) && note="read-only · Enter/→ diff · Esc quit" || note="Enter diff · → actions · Tab mark · Shift+Tab unmark all · Esc quit"
+    out=$(printf 'hdr\t%s same · %s different · %s ignored · %s ⟷ %s · %s\n' "$n_same" "$n_diff" "$n_ign" "$HERE_L" "$THERE_L" "$note"
+        [ ${#lines[@]} -gt 0 ] && printf '%s\n' "${lines[@]}"
+        if [ ${#ignored[@]} -gt 0 ]; then
+            printf 'sep\t%s── ignored by X lines ─────────────────────%s\n' "$D" "$N"
+            printf '%s\n' "${ignored[@]}"
+        fi)
+    printf '%s %s %s %s %s\n' "$n_same" "$n_changed" "$n_left" "$n_ign" "$n_failed" > "$TMP/counts"
+    # what the preview and menu need, written before fzf sees the list
+    # (the first preview used to come too early and saw nothing: "only on ...")
+    for p in "${order[@]}"; do printf '%s\t%s\n' "$(pid_of "$p")" "$p"; done > "$TMP/ids.new"
+    declare -p L_MT L_SUM L_MODE L_SIZE L_REAL R_MT R_SUM R_MODE R_SIZE R_REAL DB L_LINK R_LINK L_LOK R_LOK | sed 's/^declare -A /declare -gA /' > "$TMP/scan.new"
+    mv -f "$TMP/ids.new" "$TMP/ids"; mv -f "$TMP/scan.new" "$TMP/scan"
+    printf '%s\n' "$out"
+}
+
+path_of_id() { awk -F'\t' -v id="$1" '$1 == id { print $2; exit }' "$TMP/ids"; }
+load_scan() { [ -r "$TMP/scan" ] && source "$TMP/scan"; }
+
+is_link() { [ "${L_MODE[$1]-}" = l ] || [ "${R_MODE[$1]-}" = l ]; }
+side_desc() {   # PATH here|there: what that machine has at PATH, one line
+    local p=$1 m l ok sz
+    if [ "$2" = here ]; then m=${L_MODE[$p]-} l=${L_LINK[$p]-} ok=${L_LOK[$p]-} sz=${L_SIZE[$p]-}
+    else m=${R_MODE[$p]-} l=${R_LINK[$p]-} ok=${R_LOK[$p]-} sz=${R_SIZE[$p]-}; fi
+    if [ -z "$m" ]; then echo "missing"
+    elif [ "$m" = l ]; then
+        printf 'link → %s' "${l/#$HOME/\~}"
+        [ "$ok" = missing ] && printf '   %s(points to a missing file)%s' "$Y" "$N"
+        echo
+    else echo "regular file, $(human "$sz")"; fi
+}
+link_render() {   # PATH: both sides of a link, one per line
+    local w=$(( ${#HERE_L} > ${#THERE_L} ? ${#HERE_L} : ${#THERE_L} ))
+    printf '%s  %s\n' "$(pad $((w + 2)) "[$HERE_L]")" "$(side_desc "$1" here)"
+    printf '%s  %s\n' "$(pad $((w + 2)) "[$THERE_L]")" "$(side_desc "$1" there)"
+}
+
+# the diff for one file: render PATH WIDTH
+render() {
+    local p=$1 width=$2 kind lpath copy half
+    kind=$(kind_of "$p") lpath=$(local_path "$p") copy=$TMP/copy.$(pid_of "$p")
+    if is_link "$p"; then
+        printf '%s%s%s  %s(link)%s\n\n' "$B" "$p" "$N" "$D" "$N"
+        link_render "$p"
+        [ "$kind" = same ] && printf '\n%sidentical on both%s\n' "$G" "$N"
+        return
+    fi
+    if [ "$kind" != only_here ]; then fetch_there "$p" "$copy" 2>/dev/null || rm -f "$copy"; fi
+    printf '%s%s%s\n' "$B" "$p" "$N"
+    if [ -z "${L_MT[$p]-}${R_MT[$p]-}" ] && read_state "$p" && [ "$ST_STATE" = deleted ]; then
+        printf '%sdeleted from %s in this run%s, kept in ~/%s there\n%s→ on it to restore%s\n' "$R" \
+            "$([ "$ST_FROM" = here ] && echo "$HERE_L" || echo "$THERE_L")" "$N" "$ST_BACKUP" "$D" "$N"
+        return
+    fi
+    case $kind in
+        only_here)  printf '%sonly on %s%s\n\n' "$Y" "$HERE_L" "$N"; cat -- "$lpath" ;;
+        only_there) printf '%sonly on %s%s\n\n' "$Y" "$THERE_L" "$N"; cat -- "$copy" 2>/dev/null || echo "(couldn't fetch it)" ;;
+        same)       printf '%sidentical on both%s\n' "$G" "$N" ;;
+        *)
+            [ -f "$copy" ] || { echo "(couldn't fetch $THERE_L's copy)"; return; }
+            # this machine on the left; a line between the two sides, the
+            # names meeting at it
+            if command -v difft >/dev/null && command -v python3 >/dev/null; then
+                difft --color=always --display side-by-side-show-both --width "$(( width - 1 ))" "$lpath" "$copy" 2>/dev/null \
+                    | python3 -c "$DIFFCOL_PY" "$HERE_L" "$THERE_L" "$width"
+            else
+                half=$(( width / 2 ))
+                printf '%*s %s│%s %s\n' "$(( half - 1 ))" "$HERE_L" "$D" "$N" "$THERE_L"
+                printf '%s%s┴%s%s\n' "$D" "$(printf '─%.0s' $(seq 1 "$half"))" "$(printf '─%.0s' $(seq 1 $(( width - half - 1 ))))" "$N"
+                if command -v difft >/dev/null; then
+                    difft --color=always --display side-by-side-show-both --width "$width" "$lpath" "$copy" 2>/dev/null | tail -n +2
+                else
+                    diff -u --color=always --label "$HERE_L" --label "$THERE_L" "$lpath" "$copy"
+                fi
+            fi ;;
+    esac
+}
+
+# Puts a line between difftastic's two columns, with the machine names on
+# either side of it. difft's columns depend on the files, so the gap between
+# them is found in its output: the last column that is two spaces on every
+# row, with something after it.
+DIFFCOL_PY='
+import re, sys
+here, there, width = sys.argv[1], sys.argv[2], int(sys.argv[3])
+D, N = "\x1b[2m", "\x1b[0m"
+esc = re.compile(r"\x1b\[[0-9;]*m")
+rows = sys.stdin.read().split("\n")
+if rows and rows[-1] == "": rows.pop()
+rows = rows[1:]                       # difft repeats the file name first
+plain = [esc.sub("", r) for r in rows]
+def is_head(p): return " --- " in p   # "path --- 2/3 --- Text" between hunks
+gap = None
+for c in range(max((len(p) for p in plain), default=0) - 3, 0, -1):
+    used = [p for p in plain if len(p) >= c + 2 and not is_head(p)]
+    if used and all(p[c:c+2] == "  " for p in used) and any(p[c+2:].strip() for p in used):
+        gap = c
+        break
+def split_at(r, col):                 # cut a coloured row after COL visible chars
+    seen, i = 0, 0
+    while i < len(r) and seen < col:
+        m = esc.match(r, i)
+        if m: i = m.end(); continue
+        seen += 1; i += 1
+    return r[:i], r[i:]
+if gap is None:
+    half = width // 2
+    print(f"{here:>{half - 1}} {D}│{N} {there}")
+    print(D + "─" * half + "┴" + "─" * (width - half - 1) + N)
+    print("\n".join(rows)); sys.exit()
+total = max(len(p) for p in plain) + 1
+print(f"{here:>{gap}} {D}│{N} {there}")
+print(D + "─" * (gap + 1) + "┼" + "─" * max(1, total - gap - 2) + N)
+bar = " " + D + "│" + N + " "
+for r, p in zip(rows, plain):
+    if p == "":
+        print(" " * gap + bar)
+    elif len(p) >= gap + 2 and p[gap:gap+2] == "  " and not is_head(p):
+        a, b = split_at(r, gap)
+        lead = esc.match(b)
+        codes = ""
+        while lead:
+            codes += lead.group(); b = b[lead.end():]; lead = esc.match(b)
+        print(a + N + bar + codes + b[2:])
+    else:
+        print(r)
+'
+
+file_info() {   # header of the action menu
+    local p=$1 wl rule here_d="" there_d="" newest oldest sug oh=0 ot=0 stat copy
+    wl=$(( ${#HERE_L} > ${#THERE_L} ? ${#HERE_L} : ${#THERE_L} )); wl=$((wl + 2))
+    case $(rule_of "$p") in S) rule=SYNC ;; D) rule=DIFF ;; X) rule=IGNORE ;; esac
+    if is_link "$p"; then
+        printf '[%s]  %s  (link)\n\n' "$rule" "$p"
+        link_render "$p"; echo
+        case $(newest_of "$p") in here) newest=$HERE_L ;; there) newest=$THERE_L ;; both) newest="both changed" ;; esac
+        case $(suggest "$p") in
+            send) sug="[$HERE_L] → [$THERE_L]" ;; pull) sug="[$THERE_L] → [$HERE_L]" ;;
+            diff) sug="[diff]" ;; ignore) sug="[ignore]" ;; decide) sug="[?] changed on both, your call" ;;
+        esac
+        [[ $newest == "both changed" ]] && printf 'Newest:    %s\n' "$newest" || printf 'Newest:    [%s]\n' "$newest"
+        printf 'Suggested: %s\n' "$sug"
+        return
+    fi
+    case $(kind_of "$p") in
+        only_here) newest=$HERE_L oldest=$HERE_L here_d="+0 | -0" ;;
+        only_there) newest=$THERE_L oldest=$THERE_L there_d="+0 | -0" ;;
+        *)
+            copy=$TMP/copy.$(pid_of "$p")
+            [ -s "$copy" ] || fetch_there "$p" "$copy" 2>/dev/null
+            if [ -s "$copy" ]; then
+                stat=$(diff --unchanged-line-format= --old-line-format='-' --new-line-format='+' "$(local_path "$p")" "$copy" 2>/dev/null; true)
+                oh=$(tr -cd - <<<"$stat" | wc -c) ot=$(tr -cd + <<<"$stat" | wc -c)
+            fi
+            case $(newest_of "$p") in
+                here)  newest=$HERE_L oldest=$THERE_L here_d="+0 | -0" there_d="+$ot | -$oh" ;;
+                there) newest=$THERE_L oldest=$HERE_L there_d="+0 | -0" here_d="+$oh | -$ot" ;;
+                both)  newest="both changed" oldest="—" here_d="+$oh | -$ot" there_d="+$ot | -$oh" ;;
+            esac ;;
+    esac
+    row() {   # LABEL MTIME SIZE MODE DIFF
+        if [ -n "$2" ]; then
+            printf '%s  %s   %8s   %s   %s\n' "$(pad "$wl" "[$1]")" "$(short_time "$2")" "$(human "$3")" "$(perm_str "$4")" "$5"
+        else
+            printf '%s  missing\n' "$(pad "$wl" "[$1]")"
+        fi
+    }
+    printf '[%s]  %s\n\n' "$rule" "$p"
+    row "$HERE_L" "${L_MT[$p]-}" "${L_SIZE[$p]-}" "${L_MODE[$p]-}" "$here_d"
+    row "$THERE_L" "${R_MT[$p]-}" "${R_SIZE[$p]-}" "${R_MODE[$p]-}" "$there_d"
+    echo
+    case $(suggest "$p") in
+        send) sug="[$HERE_L] → [$THERE_L]" ;; pull) sug="[$THERE_L] → [$HERE_L]" ;;
+        diff) sug="[diff]" ;; ignore) sug="[ignore]" ;; decide) sug="[?] changed on both, your call" ;;
+    esac
+    [[ $newest == "both changed" ]] && printf 'Newest:    %s\n' "$newest" || printf 'Newest:    [%s]\n' "$newest"
+    [[ $oldest == "—" ]] && printf 'Oldest:    —\n' || printf 'Oldest:    [%s]\n' "$oldest"
+    printf 'Suggested: %s\n' "$sug"
+}
+
+pick() {   # HEADER OPTION... -> the chosen option
+    local header=$1; shift
+    printf '%s\n' "$@" | fzf --layout=reverse --no-info --cycle --prompt '› ' \
+        --header "$header" --header-first --ansi
+}
+confirm() { [ "$(pick "$1" "No" "Yes")" = Yes ]; }
+
+set_state() {   # PATH STATE [MACHINE BACKUP REALPATH] (the last three for deleted files)
+    local p=$1
+    mkdir -p "$TMP/state"
+    printf '%s %s\n%s\n%s\n%s\n%s\n' "$2" "${L_SUM[$p]-}:${R_SUM[$p]-}" "$p" "${3-}" "${4-}" "${5-}" > "$TMP/state/$(pid_of "$p")"
+}
+# read_state PATH -> ST_STATE ST_SUM ST_FROM (here/there) ST_BACKUP ST_REAL
+read_state() {
+    ST_STATE="" ST_SUM="" ST_FROM="" ST_BACKUP="" ST_REAL=""
+    local sf=$TMP/state/$(pid_of "$1") _p
+    [ -r "$sf" ] || return 1
+    { read -r ST_STATE ST_SUM; read -r _p; read -r ST_FROM; read -r ST_BACKUP; read -r ST_REAL; } < "$sf"
+}
+refresh_one() {   # rescan after an action, so the state records the new sums
+    ENTRIES_SAVE=("${ENTRIES[@]}"); scan; ENTRIES=("${ENTRIES_SAVE[@]}")
+}
+
+menu_cmd() {   # Right on a file
+    local p=$1 kind rule sug opts=() choice word
+    [ -t 1 ] && SCPQ=()
+    if read_state "$p" && [ "$ST_STATE" = deleted ] && [ -z "${L_MT[$p]-}${R_MT[$p]-}" ]; then
+        local from; [ "$ST_FROM" = here ] && from=$HERE_L || from=$THERE_L
+        choice=$(pick "[deleted]  $p
+
+Deleted from $from in this run. It's kept in ~/$ST_BACKUP there." "Restore to $from" "Back") || return 0
+        [ "$choice" = "Restore to $from" ] || return 0
+        if [ "$ST_FROM" = here ]; then restore_here "$ST_BACKUP" "$ST_REAL"; else restore_there "$ST_BACKUP" "$ST_REAL"; fi \
+            && rm -f -- "$TMP/state/$(pid_of "$p")" || pause
+        return 0
+    fi
+    kind=$(kind_of "$p") rule=$(rule_of "$p") sug=$(suggest "$p")
+    local to_there="$HERE_L → $THERE_L" to_here="$THERE_L → $HERE_L"
+    case $rule in
+        S)
+            case $kind in
+                only_here)  opts=("Copy to $THERE_L   (suggested)" "Delete from $HERE_L") ;;
+                only_there) opts=("Copy to $HERE_L   (suggested)" "Delete from $THERE_L") ;;
+                differs)
+                    case $sug in
+                        send) opts=("Send $to_there   (suggested)" "Pull $to_here") ;;
+                        pull) opts=("Pull $to_here   (suggested)" "Send $to_there") ;;
+                        *)    opts=("Send $to_there" "Pull $to_here") ;;
+                    esac ;;
+            esac
+            [ "$kind" != same ] && opts+=("Leave as is") ;;
+        D|X)
+            case $kind in
+                only_here) opts=("Sync anyway: $to_there") ;;
+                only_there) opts=("Sync anyway: $to_here") ;;
+                differs) [ "$sug" = pull ] || [ "$(newest_of "$p")" = there ] \
+                            && opts=("Sync anyway: $to_here" "Sync anyway: $to_there") \
+                            || opts=("Sync anyway: $to_there" "Sync anyway: $to_here") ;;
+            esac ;;
+    esac
+    opts+=("Show diff")
+    [ -n "$REPO_DIR" ] && opts+=("Change rule ›")
+    opts+=("Back")
+    choice=$(pick "$(file_info "$p")" "${opts[@]}") || return 0
+    case $rule in S) word=SYNC ;; D) word=DIFF ;; X) word=IGNORE ;; esac
+    case $choice in
+        "Send $to_there"*|"Copy to $THERE_L"*)
+            if do_send "$p"; then refresh_one; set_state "$p" sent; else set_state "$p" failed; pause; fi ;;
+        "Pull $to_here"*|"Copy to $HERE_L"*)
+            if do_pull "$p" "$TMP/copy.$(pid_of "$p")"; then refresh_one; set_state "$p" pulled; else set_state "$p" failed; pause; fi ;;
+        "Sync anyway: $to_there")
+            confirm "$p is marked $word in the list. Copy $HERE_L's version to $THERE_L anyway?" || return 0
+            if do_send "$p"; then refresh_one; set_state "$p" sent; else set_state "$p" failed; pause; fi ;;
+        "Sync anyway: $to_here")
+            confirm "$p is marked $word in the list. Copy $THERE_L's version to $HERE_L anyway?" || return 0
+            if do_pull "$p" "$TMP/copy.$(pid_of "$p")"; then refresh_one; set_state "$p" pulled; else set_state "$p" failed; pause; fi ;;
+        "Delete from $HERE_L")
+            confirm "Delete $p from $HERE_L? (it's moved to ~/$BACKUP_REL/, not really deleted)" || return 0
+            if delete_here "$p"; then
+                forget "$p"; set_state "$p" deleted here "$BACKUP_REL${L_REAL[$p]}" "${L_REAL[$p]}"
+            else set_state "$p" failed; pause; fi ;;
+        "Delete from $THERE_L")
+            confirm "Delete $p from $THERE_L? (it's moved to ~/$BACKUP_REL/ there, not really deleted)" || return 0
+            if delete_there "$p"; then
+                forget "$p"; set_state "$p" deleted there "$BACKUP_REL${R_REAL[$p]}" "${R_REAL[$p]}"
+            else set_state "$p" failed; pause; fi ;;
+        "Leave as is") set_state "$p" kept ;;
+        "Show diff") view_cmd "$p" ;;
+        "Change rule ›")
+            local cur new
+            cur=$(rule_of "$p")
+            new=$(pick "[$word]  $p
+Pick the new rule. The list in your repo is changed, committed and pushed." \
+                "SYNC$([ "$cur" = S ] && echo '     (current)')" \
+                "DIFF$([ "$cur" = D ] && echo '     (current)')" \
+                "IGNORE$([ "$cur" = X ] && echo '   (current)')" "Back") || return 0
+            case $new in SYNC*) new=S ;; DIFF*) new=D ;; IGNORE*) new=X ;; *) return 0 ;; esac
+            [ "$new" = "$cur" ] && return 0
+            set_rule "$p" "$new" || rules_failed
+            cp -- "$REPO_DIR/$LIST" "$TMP/rules" ;;
+    esac
+}
+
+# ---------- several files at once ---------------------------------------------------
+is_deleted() { read_state "$1" && [ "$ST_STATE" = deleted ] && [ -z "${L_MT[$1]-}${R_MT[$1]-}" ]; }
+plan_of() {   # PATH -> "send|pull|skip<TAB>what the menu shows"
+    local p=$1 kind
+    if is_deleted "$p"; then printf 'skip\tdeleted (can be restored)'; return; fi
+    kind=$(kind_of "$p")
+    [ "$kind" = same ] && { printf 'skip\talready the same'; return; }
+    case $(rule_of "$p") in
+        D) printf 'skip\tDIFF rule: skipped'; return ;; X) printf 'skip\tIGNORE rule: skipped'; return ;;
+    esac
+    case $(suggest "$p") in
+        send) printf 'send\t[%s] → [%s]  %s' "$HERE_L" "$THERE_L" "$([ "$kind" = differs ] && echo send || echo copy)" ;;
+        pull) printf 'pull\t[%s] → [%s]  %s' "$THERE_L" "$HERE_L" "$([ "$kind" = differs ] && echo send || echo copy)" ;;
+        *)    printf 'skip\t[?]  changed on both: skipped' ;;
+    esac
+}
+
+# run_group ACTION PATH...: ACTION per path is send, pull, delete or restore
+# (given as "action<TAB>path" lines on stdin). Everything for one machine runs
+# in one go; afterwards each file gets its ✓ or ✗.
+run_group() {
+    local here_ops=$TMP/ops.here there_ops=$TMP/ops.there res_here=$TMP/res.here res_there=$TMP/res.there
+    local act p id k=0 rdir="" sep=$'\x1f' jobs total
+    local -A ACT=() PATHS=() WHERE=() REAL=()
+    : > "$here_ops"; : > "$there_ops"; : > "$res_here"; : > "$res_there"
+    jobs=$(cat); total=$(grep -c . <<<"$jobs")
+    # (read from fd 3: ssh and scp in the loop would swallow stdin)
+    while IFS=$'\t' read -r act p <&3; do
+        id=$(pid_of "$p") k=$((k + 1)); ACT[$id]=$act PATHS[$id]=$p
+        case $act in
+            send)
+                WHERE[$id]=there
+                if [ "${L_MODE[$p]}" = l ]; then
+                    printf '%s%slink%s%s%s%s%s%s\n' "$id" "$sep" "$sep" "${L_LINK[$p]}" "$sep" "$p" "$sep" "${L_MT[$p]}" >> "$there_ops"
+                else
+                    [ -n "$rdir" ] || rdir=$(rrun 'mktemp -d') || return 1
+                    say "${D}Sending $k/$total${N}  $p"
+                    if scp "${SCPQ[@]}" "${SSHOPT[@]}" -- "$(local_path "$p")" "$HOST:$rdir/$k"; then
+                        printf '%s%sinstall%s%s%s%s%s%s%s%s\n' "$id" "$sep" "$sep" "$rdir/$k" "$sep" "$p" "$sep" "${L_MODE[$p]}" "$sep" "${L_MT[$p]}" >> "$there_ops"
+                    else printf '%s\tfail\tcould not copy it over\n' "$id" >> "$res_there"; fi
+                fi ;;
+            pull)
+                WHERE[$id]=here
+                if [ "${R_MODE[$p]}" = l ]; then
+                    printf '%s%slink%s%s%s%s%s%s\n' "$id" "$sep" "$sep" "${R_LINK[$p]}" "$sep" "$p" "$sep" "${R_MT[$p]}" >> "$here_ops"
+                elif say "${D}Getting $k/$total${N}  $p"; fetch_there "$p" "$TMP/pull.$k" 2>/dev/null; then
+                    printf '%s%sinstall%s%s%s%s%s%s%s%s\n' "$id" "$sep" "$sep" "$TMP/pull.$k" "$sep" "$p" "$sep" "${R_MODE[$p]}" "$sep" "${R_MT[$p]}" >> "$here_ops"
+                else printf '%s\tfail\tcould not fetch it\n' "$id" >> "$res_here"; fi ;;
+            delete)
+                if [ -n "${L_MT[$p]-}" ]; then WHERE[$id]=here REAL[$id]=${L_REAL[$p]}; printf '%s%sdelete%s%s\n' "$id" "$sep" "$sep" "$p" >> "$here_ops"
+                else WHERE[$id]=there REAL[$id]=${R_REAL[$p]}; printf '%s%sdelete%s%s\n' "$id" "$sep" "$sep" "$p" >> "$there_ops"; fi ;;
+            restore)
+                read_state "$p"; WHERE[$id]=$ST_FROM
+                printf '%s%srestore%s%s%s%s\n' "$id" "$sep" "$sep" "$ST_BACKUP" "$sep" "$ST_REAL" >> "$TMP/ops.$ST_FROM" ;;
+        esac
+    done 3<<<"$jobs"
+    local tmp
+    if [ -s "$here_ops" ]; then
+        say "${D}Putting files in place on $HERE_L…${N}"
+        tmp=$(mktemp); ops_here "$here_ops" "$tmp"; cat "$tmp" >> "$res_here"; rm -f "$tmp"
+    fi
+    if [ -s "$there_ops" ]; then
+        say "${D}Putting files in place on $THERE_L…${N}"
+        tmp=$(mktemp); ops_there "$there_ops" "$tmp"; cat "$tmp" >> "$res_there"; rm -f "$tmp"
+    fi
+    say "${D}Remembering what was synced…${N}"
+    [ -n "$rdir" ] && rrun 'rm -rf -- "$1"' "$rdir"
+    # what happened to each file
+    local -A OK=() MSG=()
+    local r st m
+    while IFS=$'\t' read -r r st m; do [ "$st" = ok ] && OK[$r]=1 || MSG[$r]=$m; done < <(cat "$res_here" "$res_there")
+    for id in "${!ACT[@]}"; do
+        p=${PATHS[$id]}
+        [ -n "${OK[$id]-}" ] || continue
+        case ${ACT[$id]} in
+            send) remember "$p" "${L_SUM[$p]}" ;; pull) remember "$p" "${R_SUM[$p]}" ;; delete) forget "$p" ;;
+        esac
+    done
+    local -A OLD_L=() OLD_R=()
+    for id in "${!ACT[@]}"; do OLD_L[$id]=${L_REAL[${PATHS[$id]}]-}; OLD_R[$id]=${R_REAL[${PATHS[$id]}]-}; done
+    refresh_one
+    local fails=()
+    for id in "${!ACT[@]}"; do
+        p=${PATHS[$id]}
+        if [ -z "${OK[$id]-}" ]; then
+            set_state "$p" failed; fails+=("$p: ${MSG[$id]:-no answer from $([ "${WHERE[$id]}" = here ] && echo "$HERE_L" || echo "$THERE_L")}")
+            continue
+        fi
+        case ${ACT[$id]} in
+            send) set_state "$p" sent ;; pull) set_state "$p" pulled ;;
+            restore) rm -f -- "$TMP/state/$id" ;;
+            delete)
+                if [ "${WHERE[$id]}" = here ]; then set_state "$p" deleted here "$BACKUP_REL${REAL[$id]}" "${REAL[$id]}"
+                else set_state "$p" deleted there "$BACKUP_REL${REAL[$id]}" "${REAL[$id]}"; fi ;;
+        esac
+    done
+    if [ ${#fails[@]} -gt 0 ]; then
+        printf '\n%s%d of %d failed:%s\n' "$R" "${#fails[@]}" "${#ACT[@]}" "$N"
+        printf '  %s\n' "${fails[@]}"
+        echo; pause
+    fi
+}
+
+group_cmd() {   # PATH...: Right with several files marked
+    [ -t 1 ] && SCPQ=()
+    local paths=("$@") p plan what n_sug=0 n_send=0 n_pull=0 n_del=0 n_res=0 n_keep=0 header wl=0
+    local -a sug_lines=() send_l=() pull_l=() del_l=() res_l=() keep_l=() ruled=()
+    for p in "${paths[@]}"; do (( ${#p} > wl )) && wl=${#p}; done
+    (( wl > 50 )) && wl=50
+    header="${#paths[@]} files marked"$'\n'
+    local shown=0 max_shown=$(( $(tput lines 2>/dev/null || echo 40) - 14 ))
+    (( max_shown < 3 )) && max_shown=3
+    for p in "${paths[@]}"; do
+        IFS=$'\t' read -r plan what <<<"$(plan_of "$p")"
+        shown=$((shown + 1))
+        if (( shown <= max_shown )); then header+="  $(pad "$wl" "$(shorten "$wl" "$p")")  $what"$'\n'
+        elif (( shown == max_shown + 1 )); then header+="  … and $(( ${#paths[@]} - max_shown )) more"$'\n'; fi
+        [ "$plan" != skip ] && sug_lines+=("$plan"$'\t'"$p")
+        if is_deleted "$p"; then res_l+=("restore"$'\t'"$p"); continue; fi
+        [ "$(kind_of "$p")" = same ] && continue
+        [ -n "${L_MT[$p]-}" ] && send_l+=("send"$'\t'"$p")
+        [ -n "${R_MT[$p]-}" ] && pull_l+=("pull"$'\t'"$p")
+        case $(kind_of "$p") in only_here|only_there) del_l+=("delete"$'\t'"$p") ;; esac
+        keep_l+=("$p")
+        [ "$(rule_of "$p")" != S ] && ruled+=("$p")
+    done
+    local opts=()
+    [ ${#sug_lines[@]} -gt 0 ] && opts+=("Do what's suggested      (${#sug_lines[@]} files)")
+    [ ${#send_l[@]} -gt 0 ] && opts+=("Send all $HERE_L → $THERE_L     (${#send_l[@]} files)")
+    [ ${#pull_l[@]} -gt 0 ] && opts+=("Pull all $THERE_L → $HERE_L     (${#pull_l[@]} files)")
+    [ ${#del_l[@]} -gt 0 ] && opts+=("Delete                   (${#del_l[@]} files that exist on one machine)")
+    [ ${#res_l[@]} -gt 0 ] && opts+=("Restore                  (${#res_l[@]} deleted files)")
+    [ ${#keep_l[@]} -gt 0 ] && opts+=("Leave as is")
+    [ -n "$REPO_DIR" ] && opts+=("Change rule ›")
+    opts+=("Back")
+    local choice; choice=$(pick "$header" "${opts[@]}") || return 0
+    # files in the chosen set that the list marks DIFF or IGNORE
+    special() { local l x out=(); for l in "$@"; do x=${l#*$'\t'}; [ "$(rule_of "$x")" != S ] && out+=("  $x  ($(word_of "$(rule_of "$x")"))"); done; [ ${#out[@]} -gt 0 ] && printf '%s\n' "${out[@]}"; }
+    local sp list=()
+    case $choice in
+        "Do what's suggested"*) list=("${sug_lines[@]}") ;;
+        "Send all"*|"Pull all"*)
+            [[ $choice == Send* ]] && list=("${send_l[@]}") || list=("${pull_l[@]}")
+            sp=$(special "${list[@]}")
+            if [ -n "$sp" ]; then
+                case $(pick "These are DIFF or IGNORE in the list:
+$sp
+
+Include them?" "Yes, include them" "No, leave them out" "Cancel") in
+                    Yes*) ;;
+                    No*) local l keep=(); for l in "${list[@]}"; do [ "$(rule_of "${l#*$'\t'}")" = S ] && keep+=("$l"); done; list=("${keep[@]}") ;;
+                    *) return 0 ;;
+                esac
+            fi ;;
+        Delete*)
+            confirm "Delete these? Each is moved to ~/$BACKUP_REL/ on its machine, not really deleted.
+$(for l in "${del_l[@]}"; do x=${l#*$'\t'}; printf '  %s  (on %s)\n' "$x" "$([ -n "${L_MT[$x]-}" ] && echo "$HERE_L" || echo "$THERE_L")"; done)" || return 0
+            list=("${del_l[@]}") ;;
+        Restore*) list=("${res_l[@]}") ;;
+        "Leave as is") for p in "${keep_l[@]}"; do set_state "$p" kept; done; return 0 ;;
+        "Change rule ›")
+            local new
+            new=$(pick "${#paths[@]} files
+Pick the new rule for all of them. The list in your repo is changed, committed and pushed once." \
+                SYNC DIFF IGNORE Back) || return 0
+            case $new in SYNC) new=S ;; DIFF) new=D ;; IGNORE) new=X ;; *) return 0 ;; esac
+            local changed=0
+            for p in "${paths[@]}"; do [ "$(rule_of "$p")" = "$new" ] || { edit_rule "$p" "$new"; changed=$((changed + 1)); }; done
+            (( changed )) || return 0
+            commit_rules "dotsync: $changed files → $(word_of "$new")" || rules_failed
+            cp -- "$REPO_DIR/$LIST" "$TMP/rules"; return 0 ;;
+        *) return 0 ;;
+    esac
+    [ ${#list[@]} -gt 0 ] || return 0
+    printf '%s\n' "${list[@]}" | run_group
+}
+
+view_cmd() {   # full screen diff
+    render "$1" "$(tput cols 2>/dev/null || echo 120)" | less -R
+}
+
+# ---------- entry points for fzf ----------------------------------------------------
+case ${1-} in
+    __list)    load_env; list_cmd; exit 0 ;;
+    __preview) load_env; load_scan; p=$(path_of_id "$2"); [ -n "$p" ] && render "$p" "${FZF_PREVIEW_COLUMNS:-80}"; exit 0 ;;
+    __view)    load_env; load_scan; p=$(path_of_id "$2"); [ -n "$p" ] && view_cmd "$p"; exit 0 ;;
+    __menu)    load_env; load_scan; shift
+               # the marked files (or the one under the cursor); not the separator
+               ps=(); for i in "$@"; do p=$(path_of_id "$i"); [ -n "$p" ] && ps+=("$p"); done
+               tput smcup 2>/dev/null; printf '\e[H\e[2J'
+               if [ ${#ps[@]} -gt 1 ]; then group_cmd "${ps[@]}"
+               elif [ ${#ps[@]} -eq 1 ]; then menu_cmd "${ps[0]}"; fi
+               tput rmcup 2>/dev/null; exit 0 ;;
+esac
+
+# ---------- are both machines on the same dotsync and list? ---------------------------
+SELF_BIN=${DOTSYNC_SELF_BIN:-/usr/local/bin/dotsync}   # (the override is for testing)
+
+# One choice, with fzf if there is one, else numbered; -y takes the first
+choose() {   # HEADER OPTION...
+    local header=$1; shift
+    if (( YES )); then printf '%s\n' "$1"; return; fi
+    if command -v fzf >/dev/null && [ -t 0 ]; then pick "$header" "$@"; return; fi
+    printf '%s\n\n' "$header" >&2
+    local i=1 o; for o in "$@"; do printf '  %d) %s\n' "$i" "$o" >&2; i=$((i + 1)); done
+    read -r -p "Choice: " i </dev/tty
+    [[ $i =~ ^[0-9]+$ ]] && (( i >= 1 && i <= $# )) && printf '%s\n' "${!i}"
+}
+
+self_sums() {   # "local remote" checksums of dotsync itself ("-" if missing)
+    local l r
+    l=$(sha256sum < "$(resolve "$SELF_BIN")" 2>/dev/null | cut -c1-64)
+    r=$(rrun "$RESOLVE_FN"$'\n''sha256sum < "$(resolve "$1")" 2>/dev/null | cut -c1-64' "$SELF_BIN")
+    echo "${l:--} ${r:--}"
+}
+check_self() {   # returns 0 when both are the same; restarts itself after updating here
+    local lsum rsum ch sug opts
+    while :; do
+        local sums
+        spin "Comparing dotsync…" sums self_sums
+        read -r lsum rsum <<<"$sums"
+        [ "$lsum" = "$rsum" ] && { step_done "✓ the same"; return 0; }    # (or on neither machine)
+        step_done "differs" "$Y"
+        ENTRIES=("$SELF_BIN"); scan
+        opts=()
+        sug=$(suggest "$SELF_BIN")
+        local send="Send $HERE_L's dotsync to $THERE_L" get="Get $THERE_L's dotsync"
+        if [ -n "${L_MT[$SELF_BIN]-}" ] && [ -n "${R_MT[$SELF_BIN]-}" ]; then
+            [ "$sug" = pull ] && opts=("$get   (suggested)" "$send") || opts=("$send$([ "$sug" = send ] && echo '   (suggested)')" "$get")
+            opts+=("Show diff")
+        elif [ -n "${L_MT[$SELF_BIN]-}" ]; then opts=("$send")
+        else opts=("$get"); fi
+        opts+=("Quit")
+        ch=$(choose "dotsync is not the same on both machines. Until it is, that's all dotsync syncs.
+
+$(file_info "$SELF_BIN")" "${opts[@]}") || exit 0
+        case $ch in
+            Send*) do_send "$SELF_BIN" || { echo "${R}Couldn't send it.${N}"; exit 1; } ;;
+            Get*)
+                do_pull "$SELF_BIN" || { echo "${R}Couldn't get it.${N}"; exit 1; }
+                echo "${G}dotsync updated, starting the new version…${N}"
+                cleanup; trap - EXIT
+                exec "$(resolve "$SELF_BIN")" "${ORIG_ARGS[@]}" ;;
+            "Show diff") view_cmd "$SELF_BIN" ;;
+            *) exit 0 ;;
+        esac
+    done
+}
+
+# Each machine: pull its clone, then report
+# "pulled ahead behind dirty sum" (or "norepo"/"nolist")
+LIST_STATUS='
+conf=$HOME/.config/dotsync/config
+repo=$(sed -n "s/^REPO=//p" "$conf" 2>/dev/null | tail -n 1); repo=${repo%\"}; repo=${repo#\"}
+list=$(sed -n "s/^LIST=//p" "$conf" 2>/dev/null | tail -n 1); list=${list%\"}; list=${list#\"}
+list=${list:-dotsync.list}; case $repo in "~"*) repo=$HOME${repo#\~} ;; esac
+[ -n "$repo" ] && [ -d "$repo/.git" ] || { echo norepo; exit 0; }
+cd "$repo" || { echo norepo; exit 0; }
+[ -f "$list" ] || { echo nolist; exit 0; }
+if git diff --quiet HEAD -- "$list" 2>/dev/null; then dirty=0; else dirty=1; fi
+pulled=0; [ "$dirty" = 0 ] && git pull -q --ff-only >/dev/null 2>&1 && pulled=1
+[ "$pulled" = 0 ] && git fetch -q >/dev/null 2>&1
+ahead=$(git rev-list --count "@{u}..HEAD" 2>/dev/null || echo 0)
+behind=$(git rev-list --count "HEAD..@{u}" 2>/dev/null || echo 0)
+echo "$pulled $ahead $behind $dirty $(sha256sum < "$list" | cut -c1-64)"'
+# bring one machine's list changes to GitHub, then to the other
+LIST_PUSH='
+conf=$HOME/.config/dotsync/config
+repo=$(sed -n "s/^REPO=//p" "$conf" | tail -n 1); repo=${repo%\"}; repo=${repo#\"}
+list=$(sed -n "s/^LIST=//p" "$conf" | tail -n 1); list=${list%\"}; list=${list#\"}
+list=${list:-dotsync.list}; case $repo in "~"*) repo=$HOME${repo#\~} ;; esac
+cd "$repo" || exit 1
+git diff --quiet HEAD -- "$list" || git commit -q -m "dotsync: list edited by hand" -- "$list" || exit 1
+git push -q 2>&1'
+LIST_PULL='
+conf=$HOME/.config/dotsync/config
+repo=$(sed -n "s/^REPO=//p" "$conf" | tail -n 1); repo=${repo%\"}; repo=${repo#\"}
+case $repo in "~"*) repo=$HOME${repo#\~} ;; esac
+cd "$repo" && git pull -q --ff-only 2>&1'
+
+list_status_both() { bash -c "$LIST_STATUS"; rrun "$LIST_STATUS"; }
+check_list() {
+    local here there h_p h_a h_b h_d h_s t_p t_a t_b t_d t_s ch opts why
+    while :; do
+        local both
+        spin "Updating the list (git pull)…" both list_status_both
+        here=${both%%$'\n'*} there=${both#*$'\n'}; [ "$there" = "$both" ] && there=""
+        case $here in norepo|nolist) step_done "—  (no clone here)" "$D"; return 0 ;; esac
+        LIST_PULLED=1
+        if [ "$there" = norepo ] || [ "$there" = nolist ] || [ -z "$there" ]; then
+            step_done "only here" "$Y"
+            echo "${Y}dotsync:${N} $THERE_L has no list clone (REPO in its config), can't compare the lists" >&2
+            return 0
+        fi
+        read -r h_p h_a h_b h_d h_s <<<"$here"; read -r t_p t_a t_b t_d t_s <<<"$there"
+        [ "$h_s" = "$t_s" ] && { step_done "✓ the same on both"; return 0; }
+        step_done "differs" "$Y"
+        local h_ch=$(( h_a > 0 || h_d > 0 )) t_ch=$(( t_a > 0 || t_d > 0 ))
+        desc() {   # LABEL AHEAD BEHIND DIRTY PULLED
+            local o=()
+            (( $4 )) && o+=("edited by hand, not committed")
+            (( $2 )) && o+=("$2 commit(s) not on GitHub")
+            (( $3 )) && o+=("$3 commit(s) behind GitHub")
+            (( ! $5 )) && (( ! $4 )) && o+=("couldn't update from GitHub")
+            [ ${#o[@]} -gt 0 ] || o+=("up to date with GitHub")
+            local out=${o[0]} x; for x in "${o[@]:1}"; do out+=", $x"; done
+            printf '  %s: %s\n' "$1" "$out"
+        }
+        why="$(desc "$HERE_L" "$h_a" "$h_b" "$h_d" "$h_p")
+$(desc "$THERE_L" "$t_a" "$t_b" "$t_d" "$t_p")"
+        opts=()
+        if (( h_ch && ! t_ch )); then opts+=("Push $HERE_L's list to GitHub and update $THERE_L")
+        elif (( t_ch && ! h_ch )); then opts+=("Push $THERE_L's list to GitHub and update $HERE_L")
+        elif (( ! h_ch && ! t_ch )); then opts+=("Try again")
+        fi
+        opts+=("Show the difference" "Quit")
+        local note=""
+        (( h_ch && t_ch )) && note=$'\n\nBoth have changes GitHub doesn'"'"'t have: fix one of them by hand (in its REPO folder), then run dotsync again.'
+        ch=$(choose "The list is not the same on both machines. Until it is, that's all dotsync syncs.
+
+$why$note" "${opts[@]}") || exit 0
+        case $ch in
+            "Push $HERE_L"*)
+                bash -c "$LIST_PUSH" > "$TMP/git.log" 2>&1 && rrun "$LIST_PULL" >> "$TMP/git.log" 2>&1 \
+                    || { cat "$TMP/git.log"; echo "${R}That didn't work.${N}"; (( YES )) && exit 1; pause; } ;;
+            "Push $THERE_L"*)
+                rrun "$LIST_PUSH" > "$TMP/git.log" 2>&1 && bash -c "$LIST_PULL" >> "$TMP/git.log" 2>&1 \
+                    || { cat "$TMP/git.log"; echo "${R}That didn't work.${N}"; (( YES )) && exit 1; pause; } ;;
+            "Try again") (( YES )) && exit 1 ;;
+            "Show the difference")
+                local other=$TMP/list.there
+                rrun 'conf=$HOME/.config/dotsync/config
+repo=$(sed -n "s/^REPO=//p" "$conf" | tail -n 1); repo=${repo%\"}; repo=${repo#\"}
+list=$(sed -n "s/^LIST=//p" "$conf" | tail -n 1); list=${list%\"}; list=${list#\"}
+case $repo in "~"*) repo=$HOME${repo#\~} ;; esac; cat "$repo/${list:-dotsync.list}"' > "$other"
+                diff -u --color=always --label "$HERE_L" --label "$THERE_L" "$REPO_DIR_GUESS/$LIST" "$other" | less -R
+                (( YES )) && exit 1 ;;
+            *) exit 0 ;;
+        esac
+    done
+}
+
+# ---------- dotsync rule: look up or change rules, for yazi's "e s" ----------------
+rule_main() {   # [--porcelain] [--set S|D|X] PATH...
+    local set="" porc=0 p lp r why paths=()
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --set) shift; set=${1^^}; set=${set:0:1} ;;
+            --porcelain) porc=1 ;;
+            *) paths+=("$1") ;;
+        esac
+        shift
+    done
+    [ ${#paths[@]} -gt 0 ] || die "usage: dotsync rule [--set S|D|X] PATH..."
+    [ -n "$REPO" ] || die "rules can only be changed with REPO set in $CONF"
+    REPO_DIR=${REPO/#\~/$HOME}
+    [ -d "$REPO_DIR/.git" ] || die "REPO=$REPO is not a git clone"
+    TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+    if [ -n "$set" ]; then
+        [[ $set == [SDX] ]] || die "--set takes S, D or X"
+        git -C "$REPO_DIR" pull -q --ff-only > "$TMP/git.log" 2>&1 || { cat "$TMP/git.log" >&2; die "couldn't update the list (git pull)"; }
+    fi
+    load_rules "$REPO_DIR/$LIST"
+    local done_l=() n=0
+    for p in "${paths[@]}"; do
+        lp=$(to_list_path "$p")
+        IFS=$'\t' read -r r why <<<"$(why_rule "$lp")"
+        if [ -z "$set" ]; then
+            if (( porc )); then printf '%s\t%s\t%s\n' "$lp" "$r" "$why"
+            else printf '%s  %s  (%s)\n' "$lp" "$([ "$r" = - ] && echo '—' || word_of "$r")" "$why"; fi
+            continue
+        fi
+        [ "$r" = "$set" ] && continue
+        edit_rule "$lp" "$set"; done_l+=("$set$lp"); n=$((n + 1))
+    done
+    [ -n "$set" ] || return 0
+    if (( n == 0 )); then echo "Nothing to change"; return 0; fi
+    local msg; (( n == 1 )) && msg="dotsync: ${done_l[0]:1} → $(word_of "$set")" || msg="dotsync: $n files → $(word_of "$set")"
+    if commit_rules "$msg"; then printf 'Added: %s\n' "${done_l[@]}"
+    else cat "$TMP/git.log" >&2; die "changed the list but couldn't commit or push it"; fi
+}
+
+# =================================================================================
+# Main run
+# =================================================================================
+
+YES=0 DRY=0 PLAIN=0 HOST="" MANIFEST="" MACHINES="" SSH_USER=${USER:-} NAMES="" REPO="" LIST=dotsync.list
+if [ -r "$CONF" ]; then
+    while IFS='=' read -r k v; do
+        v=${v%\"}; v=${v#\"}
+        case $k in
+            HOST) HOST=$v ;; MANIFEST) MANIFEST=$v ;; MACHINES) MACHINES=$v ;;
+            SSH_USER) SSH_USER=$v ;; NAMES) NAMES=$v ;; REPO) REPO=$v ;; LIST) LIST=$v ;;
+        esac
+    done < <(grep -E '^(HOST|MANIFEST|MACHINES|SSH_USER|NAMES|REPO|LIST)=' "$CONF")
+fi
+ORIG_ARGS=("$@")
+[ "${1-}" = rule ] && { shift; rule_main "$@"; exit $?; }
+while [ $# -gt 0 ]; do
+    case $1 in
+        -y|--yes-all) YES=1 ;;
+        -n|--dry-run|--status) DRY=1 ;;
+        --plain) PLAIN=1 ;;
+        --host) shift; HOST=${1-} ;;
+        -h|--help) awk 'NR > 1 && !/^#/ {exit} NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) die "unknown option: $1 (see dotsync --help)" ;;
+    esac
+    shift
+done
+
+if [ -z "$HOST" ] && [ -n "$MACHINES" ]; then
+    me=$(hostname 2>/dev/null || cat /etc/hostname); me=${me,,}
+    for m in $MACHINES; do [ "${m,,}" = "$me" ] || { HOST=$m; break; }; done
+    [ -n "$HOST" ] && [ -n "$SSH_USER" ] && HOST=$SSH_USER@$HOST
+fi
+[ -n "$HOST" ] || die "don't know the other machine: set MACHINES in $CONF (or use --host)"
+command -v ssh >/dev/null && command -v scp >/dev/null || die "needs ssh and scp"
+
+TMP=$(mktemp -d)
+SOCK=$(mktemp -u "${XDG_RUNTIME_DIR:-/tmp}/dotsync-ssh.XXXXXX")
+ssh_setup
+cleanup() { ssh "${SSHOPT[@]}" -O exit "$HOST" 2>/dev/null; rm -rf "$TMP"; }
+trap cleanup EXIT
+
+host_l=$(label_of "${HOST#*@}")
+if ! spin "Connecting to $host_l…" THERE rrun 'hostname 2>/dev/null || cat /etc/hostname'; then
+    step_done "no answer" "$R"
+    die "$host_l isn't answering over ssh: $(tail -n 1 "$TMP/spin.err")"
+fi
+step_done "✓"
+THERE=${THERE:-$HOST}
+HERE=$(hostname 2>/dev/null || cat /etc/hostname)
+HERE_L=$(label_of "$HERE") THERE_L=$(label_of "$THERE")
+REPO_DIR_GUESS=${REPO/#\~/$HOME}
+
+check_self
+ENTRIES=() S_ENTRIES=() D_ENTRIES=() X_ENTRIES=(); EXACT=()
+[ -n "$REPO" ] && check_list
+
+# The list: from the repo (pulled first), or read-only from MANIFEST
+REPO_DIR=""
+if [ -n "$REPO" ]; then
+    REPO_DIR=${REPO/#\~/$HOME}
+    [ -d "$REPO_DIR/.git" ] || die "REPO=$REPO is not a git clone"
+    (( ${LIST_PULLED:-0} )) || git -C "$REPO_DIR" pull -q --ff-only 2>/dev/null \
+        || echo "${Y}dotsync:${N} couldn't update $REPO (git pull); using the list as it is" >&2
+    [ -r "$REPO_DIR/$LIST" ] || die "no $LIST in $REPO"
+    cp -- "$REPO_DIR/$LIST" "$TMP/rules"
+else
+    case $MANIFEST in
+        http://*|https://*) curl -fsSL --max-time 15 "$MANIFEST" > "$TMP/rules" || die "couldn't download the list: $MANIFEST" ;;
+        "") die "no REPO or MANIFEST set in $CONF" ;;
+        *) f=${MANIFEST/#\~/$HOME}; [ -r "$f" ] || die "list not found: $f"; cp -- "$f" "$TMP/rules" ;;
+    esac
+fi
+load_rules "$TMP/rules"
+[ ${#ENTRIES[@]} -gt 0 ] || die "the list is empty"
+
+# ---------- interactive list ----------------------------------------------------------
+if (( ! YES && ! PLAIN )) && [ -t 1 ] && command -v fzf >/dev/null; then
+    export DOTSYNC_TMP=$TMP DOTSYNC_HOST=$HOST DOTSYNC_SOCK=$SOCK DOTSYNC_DRY=$DRY
+    export DOTSYNC_HERE=$HERE DOTSYNC_THERE=$THERE DOTSYNC_HERE_L=$HERE_L DOTSYNC_THERE_L=$THERE_L
+    export DOTSYNC_REPO=$REPO_DIR DOTSYNC_LIST=$LIST DOTSYNC_STAMP=$STAMP NAMES
+    self=$(readlink -f "$0")
+    # the cursor stays on the same row after each action, even when the file
+    # under it moves (fzf runs these small commands with bash)
+    # (the ":" form, because the command itself has brackets in it)
+    keep=(--bind "focus:execute-silent:echo \"pos(\$FZF_POS)\" > $TMP/pos"
+          --bind "load:change-header()+transform:cat $TMP/pos 2>/dev/null")
+    if (( DRY )); then
+        acts=(--bind "enter:execute($self __view {1})+change-header(refreshing…)+reload($self __list)"
+              --bind "right:execute($self __view {1})+change-header(refreshing…)+reload($self __list)")
+    else
+        # Tab marks / unmarks one file, Shift+Tab unmarks all, Ctrl+A marks
+        # all shown; → acts on the marked files (or the one under the cursor).
+        # fzf drops every mark when the list reloads, so Enter (only a diff,
+        # nothing changes) doesn't reload; → does, after its action is done.
+        acts=(--multi --marker '▌' --bind 'ctrl-a:select-all,btab:deselect-all,ctrl-d:ignore'
+              --bind "enter:execute($self __view {1})"
+              --bind "right:execute($self __menu {+1})+deselect-all+change-header(refreshing…)+reload($self __list)")
+        fzf --help 2>&1 | grep -q -- '--info-command' &&
+            acts+=(--info-command 'if [ "${FZF_SELECT_COUNT:-0}" -gt 0 ]; then echo "$FZF_MATCH_COUNT/$FZF_TOTAL_COUNT · $FZF_SELECT_COUNT marked"; else echo "$FZF_MATCH_COUNT/$FZF_TOTAL_COUNT"; fi')
+    fi
+    DOTSYNC_PROGRESS=1 "$self" __list > "$TMP/first" || die "couldn't read both machines"
+    SHELL=bash fzf < "$TMP/first" --ansi --layout=reverse --no-sort --cycle --header-lines=1 \
+        --delimiter=$'\t' --with-nth=2.. --prompt 'filter › ' "${keep[@]}" \
+        --preview "$self __preview {1}" --preview-window 'down,60%,border-top' \
+        "${acts[@]}" > /dev/null
+    read -r n_same n_changed n_left n_ign n_failed < "$TMP/counts" 2>/dev/null
+    printf '%d same, %d changed, %d left unchanged – %d still different' "${n_same:-0}" "${n_changed:-0}" "${n_left:-0}" "$(( ${n_left:-0} + ${n_failed:-0} ))"
+    (( ${n_failed:-0} )) && printf ' (%d failed)' "$n_failed"
+    (( ${n_ign:-0} )) && printf ' · %d ignored (X)' "$n_ign"
+    echo
+    (( ${n_changed:-0} )) && echo "${D}Replaced or deleted files were moved to ~/$BACKUP_REL/ on the machine they were on.${N}"
+    exit 0
+fi
+
+# ---------- -y, --plain, or no fzf: one file after another ------------------------------
+[ -t 1 ] && SCPQ=()
+DOTSYNC_PROGRESS=1 scan
+fmt_time() { date -d "@$1" '+%Y-%m-%d %H:%M'; }
+ask() {   # PROMPT DEFAULT -> REPLY_KEY
+    if (( YES )); then REPLY_KEY=$2; echo "$1 $2"; return; fi
+    read -r -n 1 -p "$1 " REPLY_KEY </dev/tty; echo
+    REPLY_KEY=${REPLY_KEY:-$2}; REPLY_KEY=${REPLY_KEY,,}
+}
+show_diff() {
+    local copy=$TMP/there
+    if is_link "$1"; then echo; link_render "$1"; echo; return; fi
+    fetch_there "$1" "$copy" || return
+    echo
+    if command -v difft >/dev/null; then difft --color=always --display side-by-side-show-both "$(local_path "$1")" "$copy" | tail -n +2
+    else diff -u --color=always --label "$HERE_L" --label "$THERE_L" "$(local_path "$1")" "$copy"; fi
+    echo
+}
+SENT=() PULLED=() SKIPPED=() SAME=() DIFFERS=() FAILED=() N_EXCL=0
+for p in "${ORDER[@]}"; do
+    rule=$(rule_of "$p") kind=$(kind_of "$p")
+    [ "$rule" = X ] && { N_EXCL=$((N_EXCL + 1)); continue; }
+    [ "$kind" = same ] && { SAME+=("$p"); continue; }
+    if [ "$rule" = D ]; then
+        echo "${B}${p}${N}  ${C}(diff only)${N}"
+        [ "$kind" = differs ] && show_diff "$p" || echo "  only on $([ "$kind" = only_here ] && echo "$HERE_L" || echo "$THERE_L")"
+        DIFFERS+=("$p"); continue
+    fi
+    case $kind in
+        only_here)
+            echo "${B}${p}${N}  ${Y}only on ${HERE_L}${N}"
+            (( DRY )) && { SKIPPED+=("$p"); continue; }
+            ask "  Copy to ${THERE_L}? [Y/n]" y
+            [ "$REPLY_KEY" = y ] && { do_send "$p" && SENT+=("$p") || FAILED+=("$p"); } || SKIPPED+=("$p") ;;
+        only_there)
+            echo "${B}${p}${N}  ${Y}only on ${THERE_L}${N}"
+            (( DRY )) && { SKIPPED+=("$p"); continue; }
+            ask "  Copy here? [Y/n]" y
+            [ "$REPLY_KEY" = y ] && { do_pull "$p" && PULLED+=("$p") || FAILED+=("$p"); } || SKIPPED+=("$p") ;;
+        differs)
+            case $(newest_of "$p") in here) newer=$HERE_L def=s ;; there) newer=$THERE_L def=p ;; both) newer="both changed" def=k ;; esac
+            echo "${B}${p}${N}  ${Y}differs${N}  ${D}${HERE_L} $(fmt_time "${L_MT[$p]}") · ${THERE_L} $(fmt_time "${R_MT[$p]}") · newest: ${newer}${N}"
+            show_diff "$p"
+            (( DRY )) && { SKIPPED+=("$p"); continue; }
+            [ "$def" = k ] && (( YES )) && { echo "  changed on both since the last sync: left as is"; SKIPPED+=("$p"); continue; }
+            while :; do
+                ask "  [s]end ${HERE_L}→${THERE_L}  [p]ull ${THERE_L}→${HERE_L}  [k]eep  [d]iff again  (default: $def)" "$def"
+                case $REPLY_KEY in
+                    s) do_send "$p" && SENT+=("$p") || FAILED+=("$p"); break ;;
+                    p) do_pull "$p" && PULLED+=("$p") || FAILED+=("$p"); break ;;
+                    k) SKIPPED+=("$p"); break ;;
+                    d) show_diff "$p" ;;
+                    *) echo "  (s, p, k or d)" ;;
+                esac
+            done ;;
+    esac
+done
+echo
+echo "${B}Summary${N}  ${D}${HERE_L} ⟷ ${THERE_L}${N}"
+printf '  %sidentical%s  %d\n' "$G" "$N" "${#SAME[@]}"
+(( N_EXCL )) && printf '  %signored (X)%s  %d\n' "$D" "$N" "$N_EXCL"
+list() { local label=$1 color=$2; shift 2; [ $# -gt 0 ] || return 0; printf '  %s%s%s  %d\n' "$color" "$label" "$N" "$#"; printf '      %s\n' "$@"; }
+list "sent to ${THERE_L}" "$G" "${SENT[@]}"
+list "pulled from ${THERE_L}" "$G" "${PULLED[@]}"
+list "different, left as is" "$Y" "${SKIPPED[@]}"
+list "diff only" "$C" "${DIFFERS[@]}"
+list "FAILED" "$R" "${FAILED[@]}"
+{ [ ${#SENT[@]} -gt 0 ] || [ ${#PULLED[@]} -gt 0 ]; } && echo "  ${D}Replaced files were backed up to ~/$BACKUP_REL/ on the machine that received them.${N}"
+[ ${#FAILED[@]} -eq 0 ]

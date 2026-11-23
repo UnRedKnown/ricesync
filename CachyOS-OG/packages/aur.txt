@@ -1,0 +1,13 @@
+app2unit
+brow6el-git
+fetch-git
+jdk
+libcava
+python-pywalfox
+quickshell-git
+sunshine-bin
+theclicker
+ttf-material-icons-git
+wayfreeze
+wifitui
+xdg-desktop-portal-termfilechooser-hunkyburrito-git

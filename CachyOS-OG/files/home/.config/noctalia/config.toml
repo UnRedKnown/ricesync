@@ -1,0 +1,19 @@
+[theme.templates.user.fuzzel_custom]
+input_path  = "templates/fuzzel.ini"
+output_path = "../fuzzel/themes/noctalia-custom"
+
+# [theme.templates.user.starship_custom]
+# input_path  = "templates/starship.toml"
+# output_path = "../starship.toml"
+
+[theme.templates.user.zed_custom]
+input_path  = "templates/zed.json"
+output_path = "../zed/themes/noctalia.json"
+
+[theme.templates.user.firefox_glass]
+input_path  = "templates/firefox-glass.css"
+output_path = "../mozilla/firefox/5qcpdgwi.default-release/chrome/noctalia-glass.css"
+
+[theme.templates.user.gtk_glass]
+input_path  = "templates/gtk-glass.css"
+output_path = "../gtk-4.0/noctalia-glass.css"

@@ -1,0 +1,162 @@
+# ricesync / CachyOS-OG — what collect.py copies.
+#
+#   [section]       core = always installed; anything else lands in SPECIFIC/<section>/
+#   home   <glob>   path relative to $HOME (dirs are copied recursively)
+#   system <glob>   absolute path. Package-owned files are only taken if you modified them.
+#   !<glob>         exclude (matched against the path relative to $HOME, or the absolute path)
+#   firefox chrome  the chrome/ dir of your default Firefox profile (profile name is dropped)
+#   settings <dir>  a folder of symlinks (your ~/Settings menu), stored as portable links
+#
+# Includes referenced from niri (include "..."), kitty (include/globinclude) and GTK
+# (@import) are followed automatically, so nothing a kept config needs gets dropped.
+
+[core]
+# --- desktop: niri + noctalia ------------------------------------------------
+home .config/niri/config.kdl
+home .config/niri/noctalia.kdl
+home .config/noctalia/config.toml
+home .config/noctalia/templates
+home .config/noctalia/wallpaper-schemes.conf
+home .local/share/noctalia/plugins
+home dev/noctalia-plugins
+system /etc/greetd/config.toml
+system /etc/pam.d/greetd
+system /etc/polkit-1/rules.d/49-noctalia-greeter-passwordless-sync.rules
+
+# --- terminal / shell / launcher ---------------------------------------------
+home .config/kitty/kitty.conf
+home .config/fish/config.fish
+home .config/fish/functions
+home .config/fish/conf.d
+home .config/starship.toml
+home .config/fuzzel/fuzzel.ini
+home .config/fuzzel/themes/noctalia-custom
+
+# --- CLI tools ---------------------------------------------------------------
+home .config/yazi
+home .config/bat/config
+home .config/btop/btop.conf
+home .config/fastfetch/config.jsonc
+home .config/micro/settings.json
+home .config/micro/bindings.json
+home .config/helix/config.toml
+home .config/htop/htoprc
+home .config/cava/config
+home .config/broot/conf.hjson
+home .config/broot/verbs.hjson
+home .config/broot/skins
+home .config/dripfetch
+home .config/umbriel/config.toml
+
+# --- editor ------------------------------------------------------------------
+home .config/zed/settings.json
+
+# --- look & feel -------------------------------------------------------------
+home .config/gtk-3.0/settings.ini
+home .config/gtk-3.0/gtk.css
+home .config/gtk-3.0/thunar.css
+home .config/gtk-3.0/bookmarks
+home .config/gtk-4.0/settings.ini
+home .config/gtk-4.0/gtk.css
+home .config/gtk-4.0/custom.css
+home .config/gtk-4.0/thunar.css
+home .config/qt6ct/qt6ct.conf
+home .config/qtengine/config.json
+home .config/fontconfig/fonts.conf
+home .local/share/fonts/MapleMono
+home .config/pywalfox/config.json
+home .mozilla/native-messaging-hosts/pywalfox.json
+home Pictures/Wallpapers/wallhaven-2k8dex*
+home Pictures/Wallpapers/wallhaven-qdkydl*
+home Pictures/Wallpapers/wallhaven-x8wewl*
+home Pictures/Wallpapers/wallhaven-yqkz8g*
+
+# --- portals / default apps --------------------------------------------------
+home .config/xdg-desktop-portal/niri-portals.conf
+home .config/xdg-desktop-portal-termfilechooser/config
+home .config/systemd/user/xdg-desktop-portal-gtk.service.d/override.conf
+home .config/xdg-terminals.list
+home .config/mimeapps.list
+home .local/share/applications/yazi.desktop
+home .local/share/applications/ouch-extract.desktop
+system /usr/share/xdg-desktop-portal/portals/termfilechooser.portal
+system /usr/share/xdg-desktop-portal/niri-portals.conf
+system /usr/share/applications/yazi.desktop
+
+# --- Firefox -----------------------------------------------------------------
+firefox chrome
+system /usr/lib/firefox/config.js
+system /usr/lib/firefox/defaults/pref/config-prefs.js
+
+# --- scripts & small system bits ---------------------------------------------
+system /usr/local/bin/*
+!/usr/local/bin/mote
+!/usr/local/bin/reboot-eos
+!/usr/local/bin/remove-nvidia
+!/usr/local/bin/vvrmods
+!/usr/local/bin/mkinitcpio
+!/usr/local/bin/cuda
+system /etc/sudoers.d/yazi
+system /etc/libinput/local-overrides.quirks
+system /etc/X11/xorg.conf.d/00-keyboard.conf
+system /etc/vconsole.conf
+system /etc/paru.conf
+
+# --- dotsync -----------------------------------------------------------------
+home .config/dotsync/config
+
+# --- ~/Settings menu (symlinks) ----------------------------------------------
+settings Settings
+
+
+[network]
+# Interface / port config only. IPs, MACs, host and network names are scrubbed.
+system /etc/NetworkManager/conf.d/*.conf
+system /etc/systemd/system/enp4s0-up.service
+system /etc/systemd/system/wol.service
+system /etc/sysctl.d/99-libvirt-bridge.conf
+system /etc/modules-load.d/br_netfilter.conf
+system /etc/qemu/bridge.conf
+system /etc/systemd/system/libvirtd.service.d/timeout.conf
+system /etc/sudoers.d/*-virsh
+system /etc/ssh/sshd_config
+system /etc/default/tailscaled
+system /etc/samba/smb.conf
+system /etc/ufw/user.rules
+system /etc/ufw/user6.rules
+system /etc/ufw/applications.d/ufw-localsend
+system /etc/ufw/applications.d/wivrn
+system /etc/systemd/resolved.conf
+system /etc/systemd/networkd.conf
+
+
+[hardware]
+system /etc/udev/rules.d/*keychron*.rules
+system /etc/udev/hwdb.d/99-logitech-m650.hwdb
+system /etc/logid.cfg
+system /etc/intel_lpmd/*.xml
+home .config/input-remapper-2
+home .local/share/icc
+
+
+[services]
+system /etc/backup.conf
+system /etc/systemd/system/backup-check.service
+system /etc/xdg/autostart/backup-notify.desktop
+
+
+# --- global excludes (apply everywhere) --------------------------------------
+[exclude]
+!**/*.bak
+!**/*.bak.*
+!**/*.bak-*
+!**/*~
+!**/*.log
+!**/*.log.*
+!**/.git
+!**/.git/**
+!**/__pycache__/**
+!.config/fish/fish_variables
+!.config/micro/backups/**
+!.config/micro/buffers/**
+!.config/kdeconnect/**

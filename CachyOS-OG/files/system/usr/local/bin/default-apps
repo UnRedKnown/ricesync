@@ -1,0 +1,209 @@
+#!/bin/bash
+# default-apps - set the default app for whole groups of file types at once
+#
+#   default-apps            preview: what would change (writes nothing)
+#   default-apps --apply    set the defaults (backs up ~/.config/mimeapps.list first)
+#   default-apps --show     list the current defaults
+#
+# Each app only gets the file types it says it can open (the MimeType= line
+# of its .desktop file), so nothing is sent to an app that can't handle it.
+# The list below is in priority order: when two apps match a type, the one
+# higher up wins. Apps that aren't installed are skipped.
+#
+# Patterns: image/*    matches every image type the app supports
+#           +text/x-*  the "+" means: from all file types your system knows,
+#                      even ones the app doesn't list (for editors, which
+#                      open any text file but only list a few types)
+#           +@text     every text-based file type (scripts, source, config, ...)
+#           +@code     source code and scripts (see CODE below)
+# Several .desktop names separated by | : the first one installed is used.
+
+APPS=(
+    # app (.desktop name)                 file types
+    "yazi.desktop                         inode/directory"
+    "firefox.desktop                      text/html application/xhtml+xml x-scheme-handler/http x-scheme-handler/https"
+    "imv-dir.desktop|imv.desktop          image/*"
+    "mpv.desktop                          audio/* video/*"
+    "firefox.desktop                      application/pdf"
+    # (office types with "+": claimed even if OnlyOffice's .desktop file
+    # doesn't list them, so the archive line below can't take docx/xlsx,
+    # which are zip files inside)
+    "onlyoffice-desktopeditors.desktop    +application/vnd.openxmlformats-officedocument.* +application/vnd.oasis.opendocument.* +application/vnd.ms-excel* +application/vnd.ms-powerpoint* +application/vnd.ms-word* +application/msword +application/rtf +text/rtf +text/csv"
+    "code.desktop|code-oss.desktop|codium.desktop|visual-studio-code.desktop   +@code"
+    "dev.zed.Zed.desktop|zed.desktop      +@text +text/* +application/json +application/xml +application/x-shellscript +application/toml +application/x-yaml +application/javascript +application/x-desktop +application/x-zerosize"
+    "ouch-extract.desktop                 application/*"
+)
+
+# What counts as "+@code": source files and scripts. Everything else that is
+# text (plain text, Markdown, logs, config files) stays with the "+@text" app.
+CODE=(
+    'text/x-*src' 'text/x-*hdr' 'text/x-c' 'text/x-c++' 'text/x-python' 'text/x-python3'
+    'application/x-shellscript' 'text/x-shellscript' 'application/x-sh' 'application/x-csh' 'text/x-fish'
+    'text/x-rust' 'text/rust' 'text/x-go' 'text/x-java' 'text/x-kotlin' 'text/x-scala' 'text/x-csharp' 'text/x-vala'
+    'text/javascript' 'application/javascript' 'application/x-javascript' 'text/x-typescript' 'application/x-typescript'
+    'text/jsx' 'text/x-tsx' 'text/css' 'text/x-scss' 'text/x-sass' 'text/x-less'
+    'application/x-php' 'text/x-php' 'text/x-lua' 'application/x-ruby' 'text/x-ruby' 'application/x-perl' 'text/x-perl'
+    'text/x-makefile' 'text/x-cmake' 'text/x-meson' 'text/x-sql' 'application/sql' 'text/x-haskell' 'text/x-ocaml'
+    'text/x-dart' 'text/x-zig' 'text/x-nim' 'text/x-julia' 'text/x-r' 'text/x-matlab' 'text/x-octave' 'text/x-pascal'
+    'text/x-fortran' 'text/x-asm' 'text/x-nasm' 'text/x-tex' 'text/x-gdscript' 'text/x-qml'
+    'application/x-ipynb+json' 'text/x-patch' 'text/x-diff' 'text/x-dockerfile' 'text/x-nix' 'text/x-kdl' 'text/x-luau'
+)
+
+set -u
+shopt -s nullglob
+
+mode=preview
+case ${1-} in
+    "") ;;
+    --apply) mode=apply ;;
+    --show) mode=show ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "usage: default-apps [--apply|--show]" >&2; exit 2 ;;
+esac
+
+if [ -t 1 ]; then B=$'\e[1m' D=$'\e[2m' G=$'\e[32m' Y=$'\e[33m' N=$'\e[0m'; else B= D= G= Y= N=; fi
+
+CFG=${XDG_CONFIG_HOME:-$HOME/.config}
+LIST=$CFG/mimeapps.list
+DATA_DIRS="${XDG_DATA_HOME:-$HOME/.local/share}:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}:$HOME/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share"
+
+# Current defaults from mimeapps.list -> CUR[type]=app
+declare -A CUR=()
+if [ -r "$LIST" ]; then
+    while IFS='=' read -r t a; do
+        [ -n "$t" ] && CUR[$t]=${a%%;*}
+    done < <(awk '/^\[/ {s = ($0 == "[Default Applications]"); next} s && /=/' "$LIST")
+fi
+
+if [ "$mode" = show ]; then
+    if [ ${#CUR[@]} -eq 0 ]; then echo "No defaults set in $LIST"; exit 0; fi
+    for t in "${!CUR[@]}"; do printf '%-50s %s\n' "$t" "${CUR[$t]}"; done | sort
+    exit 0
+fi
+
+find_desktop() {
+    local d IFS=:
+    for d in $DATA_DIRS; do
+        [ -f "$d/applications/$1" ] && { echo "$d/applications/$1"; return 0; }
+    done
+    return 1
+}
+
+# Every file type the system knows, and which of them are text-based
+# (text/* or, directly or indirectly, a kind of text/plain)
+MIME_DIRS=()
+for d in ${DATA_DIRS//:/ }; do [ -r "$d/mime/types" ] && MIME_DIRS+=("$d/mime"); done
+ALL_TYPES=$( (for m in "${MIME_DIRS[@]}"; do cat "$m/types"; done) | sort -u)
+TEXT_TYPES=$( (for m in "${MIME_DIRS[@]}"; do cat "$m/subclasses"; done) | ALL="$ALL_TYPES" awk '
+    { par[$1] = par[$1] " " $2 }
+    END {
+        n = split(ENVIRON["ALL"], t, "\n")
+        txt["text/plain"] = 1
+        do {
+            changed = 0
+            for (c in par) {
+                if (c in txt) continue
+                k = split(par[c], ps, " ")
+                for (i = 1; i <= k; i++) if (ps[i] in txt) { txt[c] = 1; changed = 1; break }
+            }
+        } while (changed)
+        for (i = 1; i <= n; i++) if (t[i] ~ /^text\// || (t[i] in txt)) print t[i]
+        for (c in txt) print c
+    }' | sort -u)
+
+matches_any() {   # TYPE PATTERN...
+    local t=$1 p; shift
+    for p; do
+        # shellcheck disable=SC2053  # $p is a pattern on purpose
+        [[ $t == $p ]] && return 0
+    done
+    return 1
+}
+
+declare -A TAKEN=()     # type -> app that got it
+declare -A PER_APP=()   # app -> types (space separated)
+order=()
+
+for entry in "${APPS[@]}"; do
+    read -r names pats <<<"$entry"
+    read -r -a patarr <<<"$pats"      # (read doesn't expand the * patterns)
+    app="" file=""
+    IFS='|' read -r -a alts <<<"$names"
+    for a in "${alts[@]}"; do
+        file=$(find_desktop "$a") && { app=$a; break; }
+    done
+    if [ -z "$app" ]; then
+        printf '%s·%s %s %s(not installed, skipped)%s\n' "$D" "$N" "${alts[0]}" "$D" "$N"; continue
+    fi
+    claims=$(awk -F= '/^\[/ {s = ($0 == "[Desktop Entry]"); next} s && $1 == "MimeType" {print $2; exit}' "$file" | tr ';' '\n')
+
+    # Split the patterns into "types the app lists" and "+" (any known type)
+    own=() any=() want_text=0 want_code=0
+    for p in "${patarr[@]}"; do
+        case $p in
+            +@text) want_text=1 ;;
+            +@code) want_code=1 ;;
+            +*) any+=("${p#+}") ;;
+            *) own+=("$p") ;;
+        esac
+    done
+    (( want_code )) && any+=("${CODE[@]}")
+
+    candidates=$(
+        [ ${#own[@]} -gt 0 ] && while read -r t; do
+            [ -n "$t" ] && matches_any "$t" "${own[@]}" && echo "$t"
+        done <<<"$claims"
+        [ ${#any[@]} -gt 0 ] && while read -r t; do
+            [ -n "$t" ] && matches_any "$t" "${any[@]}" && echo "$t"
+        done <<<"$ALL_TYPES"
+        (( want_text )) && printf '%s\n' "$TEXT_TYPES"
+    )
+
+    got=()
+    while read -r t; do
+        [ -n "$t" ] || continue
+        [ -n "${TAKEN[$t]-}" ] && continue
+        TAKEN[$t]=$app; got+=("$t")
+    done <<<"$candidates"
+    [ ${#got[@]} -eq 0 ] && { printf '%s·%s %s %s(none of its types matched)%s\n' "$D" "$N" "$app" "$D" "$N"; continue; }
+    [ -z "${PER_APP[$app]-}" ] && order+=("$app")
+    PER_APP[$app]="${PER_APP[$app]-} ${got[*]}"
+done
+
+echo
+changes=0
+for app in "${order[@]}"; do
+    read -r -a types <<<"${PER_APP[$app]}"
+    new=0
+    for t in "${types[@]}"; do [ "${CUR[$t]-}" = "$app" ] || new=$((new + 1)); done
+    changes=$((changes + new))
+    printf '%s%s%s  %d types, %s%d new or changed%s\n' "$B" "$app" "$N" "${#types[@]}" "$Y" "$new" "$N"
+    printf '   %s%s%s\n' "$D" "$(printf '%s ' "${types[@]:0:6}")$([ ${#types[@]} -gt 6 ] && echo "…")" "$N"
+done
+
+# A desktop-specific list (e.g. niri-mimeapps.list) is read before
+# mimeapps.list and would override these
+desktops=${XDG_CURRENT_DESKTOP-}
+for d in ${desktops//:/ }; do
+    f=$CFG/${d,,}-mimeapps.list
+    [ -e "$f" ] && printf '\n%s!%s %s exists and is read first; its entries override mimeapps.list\n' "$Y" "$N" "$f"
+done
+
+if [ "$mode" = preview ]; then
+    printf '\n%d defaults would change. Run %sdefault-apps --apply%s to set them.\n' "$changes" "$B" "$N"
+    exit 0
+fi
+
+if [ "$changes" -eq 0 ]; then echo; echo "Nothing to change."; exit 0; fi
+command -v xdg-mime >/dev/null || { echo "default-apps: xdg-mime not found (install xdg-utils)" >&2; exit 1; }
+
+if [ -e "$LIST" ]; then
+    backup=$LIST.bak-$(date +%Y%m%d-%H%M%S)
+    cp -p -- "$LIST" "$backup" || { echo "default-apps: couldn't back up $LIST, nothing changed" >&2; exit 1; }
+    echo; echo "Backup: $backup"
+fi
+for app in "${order[@]}"; do
+    read -r -a types <<<"${PER_APP[$app]}"
+    xdg-mime default "$app" "${types[@]}" || echo "default-apps: xdg-mime failed for $app" >&2
+done
+printf '%s✓%s %d defaults set in %s\n' "$G" "$N" "$changes" "$LIST"

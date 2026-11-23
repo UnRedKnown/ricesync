@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# wallpaper-scheme - pick Noctalia's Material color scheme per wallpaper
+#
+#   wallpaper-scheme [WALLPAPER]     default: $NOCTALIA_WALLPAPER_PATH
+#
+# Looks the wallpaper up in ~/.config/noctalia/wallpaper-schemes.conf and sets
+# [theme] wallpaper_scheme to the matching scheme, then reloads Noctalia.
+#
+# Mapping file, one rule per line, first match wins:
+#     <pattern>   <scheme>
+#   pattern: a file name or glob, matched against the file name and full path
+#   scheme:  m3-tonal-spot m3-content m3-fruit-salad m3-rainbow m3-monochrome
+#            vibrant faithful dysfunctional muted
+#   Example:
+#     wall1.png          m3-tonal-spot
+#     wall2.png          m3-fruit-salad
+#     */anime/*          m3-rainbow
+#     *                  m3-content        # default for everything else
+#
+# Safety: only ever changes the existing "wallpaper_scheme = ..." line inside
+# the [theme] section of a Noctalia config file. If no such line exists, or
+# anything looks wrong, it changes nothing and says why.
+# The first time it edits a file, the original is kept as <file>.bak.
+
+set -euo pipefail
+
+MAP="${XDG_CONFIG_HOME:-$HOME/.config}/noctalia/wallpaper-schemes.conf"
+VALID="m3-tonal-spot m3-content m3-fruit-salad m3-rainbow m3-monochrome vibrant faithful dysfunctional muted"
+
+# Noctalia config files, checked in this order (the settings GUI writes the
+# first one; a hand-written config may be the second)
+CANDIDATES=(
+    "${XDG_STATE_HOME:-$HOME/.local/state}/noctalia/settings.toml"
+    "${XDG_CONFIG_HOME:-$HOME/.config}/noctalia/config.toml"
+)
+
+die() {
+    echo "wallpaper-scheme: $*" >&2
+    notify-send -a wallpaper-scheme "Color scheme not changed" "$*" 2>/dev/null || true
+    exit 1
+}
+
+wall=${1:-${NOCTALIA_WALLPAPER_PATH:-}}
+[[ -n $wall ]] || die "no wallpaper given"
+[[ -r $MAP ]] || exit 0              # no mapping file: nothing to do
+
+# --- find the scheme for this wallpaper ---------------------------------------
+name=$(basename -- "$wall")
+scheme=""
+while read -r pattern value _; do
+    [[ -z $pattern || $pattern == \#* ]] && continue
+    # shellcheck disable=SC2053  # pattern is intentionally a glob
+    if [[ $name == $pattern || $wall == $pattern ]]; then
+        scheme=$value
+        break
+    fi
+done < "$MAP"
+
+[[ -n $scheme ]] || exit 0           # no rule matched: leave the scheme alone
+[[ " $VALID " == *" $scheme "* ]] || die "unknown scheme '$scheme' in $MAP"
+
+# --- editing safely while Noctalia may be writing the same file -------------
+#
+# When the wallpaper changes, Noctalia saves settings.toml itself at the same
+# moment it runs this hook. So every attempt:
+#   1. waits until the file has stopped changing,
+#   2. works on a snapshot taken while it's stable,
+#   3. replaces the file only if it's still identical to that snapshot,
+# and finally checks that Noctalia didn't save over the change. If anything
+# moved in between, it starts over (a few times) instead of overwriting.
+
+has_setting() {
+    awk '/^\[/ {in_theme = ($0 ~ /^\[theme\][[:space:]]*$/)}
+         in_theme && /^[[:space:]]*wallpaper_scheme[[:space:]]*=/ {found = 1}
+         END {exit !found}' "$1"
+}
+
+scheme_in() {
+    awk -F= '/^\[/ {t = ($0 ~ /^\[theme\][[:space:]]*$/)}
+             t && /^[[:space:]]*wallpaper_scheme[[:space:]]*=/ {
+                 v = $2; gsub(/[[:space:]"]/, "", v); print v; exit }' "$1"
+}
+
+# File identity: modification time (ns), size and inode
+sig() { stat -c '%y %s %i' -- "$1" 2>/dev/null; }
+
+# Wait until the file hasn't changed for 0.5 s (gives up after ~10 s)
+wait_quiet() {
+    local a b i
+    for (( i = 0; i < 20; i++ )); do
+        a=$(sig "$1"); sleep 0.5; b=$(sig "$1")
+        [[ -n $a && $a == "$b" ]] && return 0
+    done
+    return 1
+}
+
+# In the hook, give Noctalia a moment to start its own save first
+[[ -n ${NOCTALIA_WALLPAPER_PATH:-} ]] && sleep 1
+
+snap=$(mktemp); tmp=""
+trap 'rm -f -- "$snap" ${tmp:+"$tmp"}' EXIT
+
+attempt_edit() {            # returns 0 done, 1 retry, 2 fatal (message in ERR)
+    local f before after changed
+    conf=""
+    for f in "${CANDIDATES[@]}"; do
+        [[ -f $f ]] || continue
+        wait_quiet "$f" || { ERR="$f keeps changing"; return 1; }
+        before=$(sig "$f"); cp -- "$f" "$snap"; after=$(sig "$f")
+        [[ $before == "$after" ]] || return 1          # changed while copying
+        if has_setting "$snap"; then conf=$f; SNAP_SIG=$before; break; fi
+    done
+    if [[ -z $conf ]]; then
+        ERR="no 'wallpaper_scheme' under [theme] in ${CANDIDATES[*]}. Pick any wallpaper scheme once in Noctalia's settings, then try again."
+        return 1
+    fi
+
+    [[ $(scheme_in "$snap") == "$scheme" ]] && return 0   # already set
+
+    tmp=$(mktemp "$conf.XXXXXX")
+    awk -v s="$scheme" '
+        /^\[/ {t = ($0 ~ /^\[theme\][[:space:]]*$/)}
+        t && !done && /^[[:space:]]*wallpaper_scheme[[:space:]]*=/ {
+            match($0, /^[[:space:]]*/)
+            print substr($0, 1, RLENGTH) "wallpaper_scheme = \"" s "\""
+            done = 1
+            next
+        }
+        {print}
+    ' "$snap" > "$tmp"
+
+    # awk always ends its output with a newline. If the original didn't end
+    # with one, remove it again so nothing but the one line changes.
+    if [[ -s $snap && -n $(tail -c1 -- "$snap") ]]; then
+        truncate -s -1 -- "$tmp"
+    fi
+
+    # Sanity check: exactly one line differs from the snapshot
+    changed=$(diff -- "$snap" "$tmp" | grep -c '^>' || true)
+    if [[ $changed -ne 1 ]]; then
+        local report="${XDG_RUNTIME_DIR:-/tmp}/wallpaper-scheme.diff"
+        diff -u -- "$snap" "$tmp" > "$report" 2>&1
+        rm -f -- "$tmp"; tmp=""
+        ERR="unexpected edit result ($changed changed lines), $conf left unchanged. The attempted change is in $report"
+        return 2
+    fi
+
+    # Replace only if nobody wrote the file since the snapshot
+    if [[ $(sig "$conf") != "$SNAP_SIG" ]] || ! cmp -s -- "$conf" "$snap"; then
+        rm -f -- "$tmp"; tmp=""
+        return 1
+    fi
+    [[ -f $conf.bak ]] || cp -p -- "$snap" "$conf.bak"
+    chmod --reference="$conf" "$tmp"
+    mv -- "$tmp" "$conf"; tmp=""
+    return 0
+}
+
+ERR=""; done_ok=0
+for (( try = 1; try <= 5; try++ )); do
+    attempt_edit && rc=0 || rc=$?
+    (( rc == 2 )) && die "$ERR"
+    if (( rc == 0 )); then
+        noctalia msg config-reload >/dev/null 2>&1 || true
+        # Make sure Noctalia didn't save its old value over ours right after
+        sleep 1
+        wait_quiet "$conf" || true
+        if [[ $(scheme_in "$conf") == "$scheme" ]]; then
+            done_ok=1
+            break
+        fi
+    fi
+    sleep 1
+done
+
+(( done_ok )) || die "${ERR:-Noctalia kept changing $conf}; scheme not changed"
+echo "wallpaper_scheme = $scheme  ($conf)"

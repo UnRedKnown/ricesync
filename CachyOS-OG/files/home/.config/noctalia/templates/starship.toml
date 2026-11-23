@@ -1,0 +1,74 @@
+# change sudo string for icon
+
+"$schema" = 'https://starship.rs/config-schema.json'
+add_newline = true
+
+format = """
+([](fg:{{ colors.secondary_container.default.hex }})\
+$jobs\
+[](fg:{{ colors.secondary_container.default.hex }}))\
+([](fg:{{ colors.primary_container.default.hex }})\
+$cmd_duration\
+$status\
+[](fg:{{ colors.primary_container.default.hex }})
+)$time\
+$username\
+$hostname\
+[](fg:{{ colors.surface_container_highest.default.hex }})\
+([ ](fg:{{ colors.surface_container.default.hex }})\
+$git_branch\
+$git_status\
+[](fg:{{ colors.surface_container.default.hex }}))\
+$line_break\
+$directory\
+$sudo\
+$character"""
+
+[jobs]
+format = "[ $number](bg:{{ colors.secondary_container.default.hex }} fg:{{ colors.secondary.default.hex }})"
+number_threshold = 1
+
+[cmd_duration]
+min_time = 2000
+format = "[$duration ](bg:{{ colors.primary_container.default.hex }} fg:{{ colors.primary.default.hex }})"
+
+[status]
+disabled = false
+format = "[$status](bg:{{ colors.primary_container.default.hex }} fg:{{ colors.error.default.hex }})"
+
+[time]
+disabled = false
+time_format = "%R"
+format = "[ $time ](bg:{{ colors.surface_container_highest.default.hex }} fg:{{ colors.primary.default.hex }})"
+
+[username]
+show_always = true
+format = "[$user](bg:{{ colors.surface_container_highest.default.hex }} fg:{{ colors.primary.default.hex }})"
+style_user = ""
+style_root = ""
+
+[hostname]
+ssh_only = false
+format = "[@$hostname ](bg:{{ colors.surface_container_highest.default.hex }} fg:{{ colors.primary.default.hex }})"
+
+[git_branch]
+symbol = ""
+format = "[ $symbol $branch ](bg:{{ colors.surface_container.default.hex }} fg:{{ colors.primary.default.hex }})"
+
+[git_status]
+format = "[($all_status$ahead_behind )](bg:{{ colors.surface_container.default.hex }} fg:{{ colors.primary.default.hex }})"
+
+[directory]
+truncation_length = 3
+truncation_symbol = "…/"
+format = "[$read_only$path ](fg:{{ colors.primary.default.hex }})"
+read_only = "󰌾 "
+truncate_to_repo = false
+
+[sudo]
+disabled = false
+format = "[󰔙](fg:{{ colors.primary.default.hex }})"
+
+[character]
+success_symbol = "[❯](bold fg:{{ colors.primary.default.hex }})"
+error_symbol = "[❯](bold fg:{{ colors.error.default.hex }})"

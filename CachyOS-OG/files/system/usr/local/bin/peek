@@ -1,0 +1,144 @@
+#!/bin/bash
+# peek - show an image in a small floating window, or hide it if it's showing
+#
+#   peek [-w PCT] [-h PCT] [-g PX] [IMAGE]
+#     -w   max width,  % of the screen      (default 60)
+#     -h   max height, % of the screen      (default 70)
+#     -g   gap below the bar, in pixels     (default 8)
+#     IMAGE defaults to the timetable
+#
+# Defaults can also be set in ~/.config/peek.conf, e.g.
+#     MAX_W=40
+#     MAX_H=50
+#     GAP=8
+#     IMAGE=@HOME@/Desktop/Mniej ważne/Plan/Plan.png
+# Options on the command line win over the file.
+#
+# Bind it to a key in niri; pressing the key again closes the window, and so
+# do Esc and moving the focus to any other window (clicking it, or switching
+# with the keyboard). Clicks on the bar or the bare desktop don't move the
+# focus, so they leave it open. The
+# window is found by its title (imv puts the file name in it), so several
+# different images can each have their own key. The window is fitted to the
+# image's shape (no black bars), centred at the top below the bar.
+
+MAX_W=60
+MAX_H=70
+GAP=8
+IMAGE="@HOME@/Desktop/Mniej ważne/Plan/Plan.png"
+
+# Settings file: only KEY=value lines for these four keys are read
+conf=${XDG_CONFIG_HOME:-$HOME/.config}/peek.conf
+if [ -r "$conf" ]; then
+    while IFS= read -r line; do
+        case $line in
+            MAX_W=*) v=${line#*=}; [[ $v =~ ^[0-9]+$ ]] && MAX_W=$v ;;
+            MAX_H=*) v=${line#*=}; [[ $v =~ ^[0-9]+$ ]] && MAX_H=$v ;;
+            GAP=*)   v=${line#*=}; [[ $v =~ ^[0-9]+$ ]] && GAP=$v ;;
+            IMAGE=*) v=${line#*=}; v=${v#\"}; v=${v%\"}; v=${v/#\~/$HOME}; [ -n "$v" ] && IMAGE=$v ;;
+        esac
+    done < "$conf"
+fi
+
+usage() { sed -n '4,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+while getopts 'w:h:g:' opt; do
+    case $opt in
+        w) MAX_W=$OPTARG ;;
+        h) MAX_H=$OPTARG ;;
+        g) GAP=$OPTARG ;;
+        *) usage ;;
+    esac
+done
+shift $((OPTIND - 1))
+for v in "$MAX_W" "$MAX_H" "$GAP"; do [[ $v =~ ^[0-9]+$ ]] || usage; done
+
+img=${1:-$IMAGE}
+name=$(basename -- "$img")
+
+find_window() {
+    niri msg --json windows 2>/dev/null | jq -r --arg n "$name" '
+        .[] | select(.app_id == "imv" and ((.title // "") | contains($n))) | .id' | head -n 1
+}
+
+# Already open? Then close it.
+id=$(find_window)
+if [ -n "$id" ]; then
+    niri msg action close-window --id "$id"
+    exit 0
+fi
+
+if [ ! -r "$img" ]; then
+    notify-send -a peek "Image not found" "$img"
+    exit 1
+fi
+command -v imv >/dev/null || { notify-send -a peek "peek" "imv is not installed (sudo pacman -S imv)"; exit 1; }
+
+# Work out the size first, so imv can open at the right size straight away
+# (resizing afterwards makes it flash big for a moment).
+# Screen size in logical pixels (what niri and Wayland windows use)
+read -r sw sh < <(niri msg --json focused-output 2>/dev/null | jq -r '"\(.logical.width) \(.logical.height)"')
+size=()
+if [[ ${sw-} =~ ^[0-9]+$ && ${sh-} =~ ^[0-9]+$ ]]; then
+    maxw=$(( sw * MAX_W / 100 ))
+    maxh=$(( sh * MAX_H / 100 ))
+    w=$maxw h=$maxh
+    # Match the image's shape
+    if read -r iw ih < <(magick identify -format '%w %h\n' "$img[0]" 2>/dev/null) && [ "${iw:-0}" -gt 0 ] && [ "${ih:-0}" -gt 0 ]; then
+        h=$(( maxw * ih / iw ))
+        if [ "$h" -gt "$maxh" ]; then
+            h=$maxh
+            w=$(( maxh * iw / ih ))
+        fi
+    fi
+    size=(-W "$w" -H "$h")
+fi
+
+# Esc closes this imv (only this one: your other imv windows keep their keys)
+setsid -f imv -c 'bind <Escape> quit' "${size[@]}" -- "$img" >/dev/null 2>&1
+
+# Wait for the window (up to 3 s)
+for _ in $(seq 30); do
+    id=$(find_window)
+    [ -n "$id" ] && break
+    sleep 0.05
+done
+[ -n "$id" ] || exit 0
+
+# Close it as soon as the focus moves to another window. Runs in the
+# background and ends when the window closes, however that happens.
+watch_focus() {
+    local id=$1 seen=0 ev kind wid stream
+    # already focused when the watcher starts? (the usual case)
+    [ "$(niri msg --json focused-window 2>/dev/null | jq -r '.id // empty')" = "$id" ] && seen=1
+    exec 3< <(exec niri msg --json event-stream 2>/dev/null)
+    stream=$!
+    while IFS= read -r ev <&3; do
+        # niri starts the stream with the full window list (focus included),
+        # then sends only the changes
+        IFS=' ' read -r kind wid < <(jq -r '
+            if .WindowFocusChanged then "focus \(.WindowFocusChanged.id // "none")"
+            elif .WindowsChanged then
+                "focus \(first(.WindowsChanged.windows[] | select(.is_focused) | .id) // "none")"
+            elif .WindowClosed then "closed \(.WindowClosed.id)"
+            else "other -" end' <<<"$ev" 2>/dev/null)
+        case $kind in
+            closed) [ "$wid" = "$id" ] && break ;;
+            focus)
+                # only after it has had the focus once (niri gives new windows
+                # the focus a moment after they appear)
+                if [ "$wid" = "$id" ]; then seen=1
+                elif (( seen )); then niri msg action close-window --id "$id" >/dev/null 2>&1; break; fi ;;
+        esac
+    done
+    kill "$stream" 2>/dev/null
+}
+watch_focus "$id" >/dev/null 2>&1 &
+disown
+
+[ ${#size[@]} -gt 0 ] || exit 0
+
+# Make sure size and position are right (in case a window rule or niri
+# changed them)
+niri msg action set-window-width  --id "$id" "$w"
+niri msg action set-window-height --id "$id" "$h"
+niri msg action move-floating-window --id "$id" -x $(( (sw - w) / 2 )) -y "$GAP"

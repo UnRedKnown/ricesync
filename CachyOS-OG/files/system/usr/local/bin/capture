@@ -1,0 +1,682 @@
+#!/usr/bin/env bash
+# capture - Spectacle-style screenshots, OCR and screen recording for niri
+#
+#   capture            region screenshot -> clipboard + file  (bind to Print)
+#   capture menu       pick a mode with fuzzel
+#   capture MODE       region | edit | window | window-focused |
+#                      window-niri | window-focused-niri |
+#                      screen | screen-focused | all | ocr | lens |
+#                      rec-region | rec-screen | rec-screen-focused |
+#                      rec-all | stop
+#
+# While a recording is running, ANY invocation stops it (so Print = stop).
+#
+# Needs: grim slurp wl-clipboard libnotify fuzzel jq
+#        satty (edit)  tesseract + data packages, imagemagick (ocr, lens)
+#        a web browser (lens: Google image search)
+#        gpu-screen-recorder + pipewire-pulse (recording with audio)
+#        ffmpeg (joining recordings that span several monitors)
+#        wayfreeze (optional: freeze the screen while selecting)
+
+set -uo pipefail
+
+# --- settings -----------------------------------------------------------------
+SHOT_DIR="$HOME/Pictures/Screenshots"
+REC_DIR="$HOME/Videos/Recordings"
+OCR_LANGS="eng+pol"        # tesseract languages, joined with +
+OCR_PSM=6                  # tesseract layout mode: 6 = one block of text (UI,
+                           # code, paragraphs), 3 = automatic (multi-column)
+REC_AUDIO=1                # 1 = record system/desktop audio, 0 = no audio
+REC_FPS=60                 # recording frame rate
+REC_INDICATOR="red/rec-indicator:indicator"   # Noctalia bar widget; "" to disable
+LENS_URL="https://lens.google.com/v3/upload?ep=ccm"   # Google image search upload
+FREEZE=1                   # 1 = freeze the screen while picking a region/screen
+                           #     (needs wayfreeze; skipped if not installed)
+FREEZE_MENU=1              # 1 = freeze as soon as the menu opens, so the picked
+                           #     screenshot shows the moment you pressed the key
+SHOW_CURSOR=0              # 1 = include the mouse cursor in screenshots/recordings
+
+# Menu entries, shown top to bottom in this order: "Label|mode"
+# Reorder, rename, or delete lines freely. Labels must not contain "|".
+# Two entries may have the same label; the line's position decides what runs.
+# The first entry is preselected, so Enter alone runs it.
+# Modes are the ones listed in the header above.
+MENU=(
+    " Region|region"
+    " Region|rec-region"
+    " Screen|rec-screen"
+    " All screens|rec-all"
+    " Window|window"
+    " Markup (region)|edit"
+    " Screen|screen"
+    " All screens|all"
+    " Text from region (OCR)|ocr"
+    " Google Lens|lens"
+)
+# ------------------------------------------------------------------------------
+
+mkdir -p "$SHOT_DIR" "$REC_DIR"
+
+notify() { notify-send -a capture -t 3000 "$@"; }
+stamp()  { date +%Y-%m-%d_%H-%M-%S; }
+
+# Freeze the screen: wayfreeze shows a still image of every monitor on top of
+# everything, so you can take your time selecting. grim then captures that
+# still image, so you get exactly the moment you pressed the key.
+#
+# wayfreeze also reacts to Esc (it exits). A watcher notices that and closes
+# slurp/fuzzel too, so a single Esc always cancels everything.
+FREEZE_PID=""
+WATCH_PID=""
+freeze_start() {
+    (( FREEZE )) || return 0
+    [[ -n $FREEZE_PID ]] && return 0     # already frozen (e.g. from the menu)
+    command -v wayfreeze >/dev/null || return 0
+    local wf_args=()
+    (( SHOW_CURSOR )) || wf_args=(--hide-cursor)
+    wayfreeze "${wf_args[@]}" >/dev/null 2>&1 &
+    FREEZE_PID=$!
+    trap freeze_stop EXIT       # unfreeze however the script ends (Esc, error)
+
+    # If wayfreeze exits on its own (Esc), cancel the pickers as well
+    (
+        while kill -0 "$FREEZE_PID" 2>/dev/null; do sleep 0.05; done
+        pkill -x slurp
+        pkill -x fuzzel
+    ) &
+    WATCH_PID=$!
+
+    sleep 0.15                  # let the frozen image appear before slurp
+}
+freeze_stop() {
+    if [[ -n $WATCH_PID ]]; then
+        kill "$WATCH_PID" 2>/dev/null   # stop watcher first so it won't kill
+        wait "$WATCH_PID" 2>/dev/null   # pickers we start after unfreezing
+        WATCH_PID=""
+    fi
+    [[ -n $FREEZE_PID ]] || return 0
+    kill "$FREEZE_PID" 2>/dev/null
+    wait "$FREEZE_PID" 2>/dev/null
+    FREEZE_PID=""
+}
+
+# Drag to select a region. Works across monitors. Esc cancels (non-zero exit).
+pick_region() { slurp -d 2>/dev/null; }
+
+# Click a monitor to select it; prints its name (e.g. DP-1). Esc cancels.
+pick_output() { slurp -o -r -f '%o' 2>/dev/null; }
+
+focused_output() { niri msg --json focused-output | jq -r .name; }
+
+# grim leaves the cursor out unless given -c. While the screen is frozen, the
+# frozen image decides (wayfreeze is told to hide it), so -c is only added
+# for live captures.
+cursor_args() {
+    CURSOR_ARGS=()
+    (( SHOW_CURSOR )) && [[ -z $FREEZE_PID ]] && CURSOR_ARGS=(-c)
+}
+
+# Save a grim capture, copy it, and show a notification with a thumbnail.
+# Arguments are passed to grim (e.g. -g GEOMETRY or -o OUTPUT).
+save_shot() {
+    local file
+    file="$SHOT_DIR/$(stamp).png"
+    cursor_args
+    if ! grim "${CURSOR_ARGS[@]}" "$@" "$file"; then
+        notify "Screenshot failed"
+        exit 1
+    fi
+    freeze_stop
+    wl-copy --type image/png < "$file"
+    notify -i "$file" "Screenshot copied" "$(basename "$file")"
+}
+
+shot_region() {
+    local geom
+    freeze_start
+    geom=$(pick_region) || exit 0
+    save_shot -g "$geom"
+}
+
+shot_edit() {
+    local geom tmp
+    freeze_start
+    geom=$(pick_region) || exit 0
+    tmp=$(mktemp --suffix=.png)
+    cursor_args
+    grim "${CURSOR_ARGS[@]}" -g "$geom" "$tmp" || exit 1
+    freeze_stop
+    satty --filename "$tmp" \
+        --output-filename "$SHOT_DIR/$(stamp).png" \
+        --copy-command wl-copy \
+        --early-exit
+    rm -f "$tmp"
+}
+
+# Where window ID is on screen, as "x,y wxh" for grim (logical pixels), if it
+# is fully visible: on a workspace that's showing, not scrolled partly off the
+# screen. niri tells window positions (layout.tile_pos_in_workspace_view) only
+# for those; anything else fails, and the callers fall back to niri's own shot.
+window_geom() {
+    local id=$1 w ws out
+    w=$(niri msg --json windows | jq -c --argjson id "$id" '.[] | select(.id == $id)')
+    [[ -n $w ]] || return 1
+    ws=$(jq -r '.workspace_id // empty' <<<"$w")
+    out=$(niri msg --json workspaces | jq -r --argjson ws "${ws:-0}" \
+        '.[] | select(.id == $ws and .is_active) | .output // empty')
+    [[ -n $out ]] || return 1
+    jq -nr --argjson w "$w" --argjson o "$(niri msg --json outputs | jq -c --arg o "$out" '.[$o].logical')" '
+        ($w.layout.tile_pos_in_workspace_view // null) as $p
+        | if $p == null then empty else
+            ($o.x + $p[0] + $w.layout.window_offset_in_tile[0] | round) as $x
+          | ($o.y + $p[1] + $w.layout.window_offset_in_tile[1] | round) as $y
+          | $w.layout.window_size as $s
+          | if $x < $o.x or $y < $o.y or $x + $s[0] > $o.x + $o.width or $y + $s[1] > $o.y + $o.height
+            then empty else "\($x),\($y) \($s[0])x\($s[1])" end
+          end'
+}
+
+# A window as you see it: grabbed from the screen, so see-through windows
+# keep the blurred wallpaper behind them. Anything on top of the window
+# (a notification, a floating window) is in the shot too. Windows that
+# aren't fully on screen get niri's own window shot instead.
+shot_window_area() {   # ID
+    local geom
+    geom=$(window_geom "$1")
+    if [[ -n $geom ]]; then
+        sleep 0.1                               # let the pick cursor go away
+        save_shot -g "$geom"
+    else
+        niri msg action screenshot-window --id "$1"
+        notify "Window screenshot copied" "Not fully on screen: taken without what's behind it"
+    fi
+}
+
+shot_window_pick() {
+    local id
+    id=$(niri msg --json pick-window | jq -r '.id // empty')
+    [[ -n $id ]] || exit 0                      # Esc / clicked on nothing
+    shot_window_area "$id"
+}
+
+shot_window_focused() {
+    local id
+    id=$(niri msg --json focused-window | jq -r '.id // empty')
+    [[ -n $id ]] || { notify "No window has the focus"; exit 0; }
+    shot_window_area "$id"
+}
+
+# niri's own window shot: niri renders the window by itself, so it's complete
+# even when partly scrolled off-screen or covered, but see-through parts come
+# out empty. Saved to niri's screenshot-path and copied to the clipboard.
+shot_window_pick_niri() {
+    local id
+    id=$(niri msg --json pick-window | jq -r '.id // empty')
+    [[ -n $id ]] || exit 0                      # Esc / clicked on nothing
+    niri msg action screenshot-window --id "$id"
+    notify "Window screenshot copied"
+}
+
+shot_window_focused_niri() {
+    niri msg action screenshot-window
+    notify "Window screenshot copied"
+}
+
+shot_screen_pick() {
+    local out
+    freeze_start
+    out=$(pick_output) || exit 0
+    [[ -n $out ]] || exit 0
+    save_shot -o "$out"
+}
+
+shot_screen_focused() {
+    save_shot -o "$(focused_output)"
+}
+
+# Every monitor in one image, laid out as they are arranged
+shot_all() {
+    save_shot
+}
+
+# OCR works much better on large, dark-on-light text than on small screen text,
+# so the capture is converted to grayscale, inverted if it's a dark theme,
+# and enlarged 3x before tesseract reads it.
+ocr_region() {
+    local geom tmp text im mean neg=()
+    freeze_start
+    geom=$(pick_region) || exit 0
+    tmp=$(mktemp --suffix=.png)
+    grim -g "$geom" "$tmp" || { rm -f "$tmp"; exit 1; }
+    freeze_stop
+
+    im=magick; command -v magick >/dev/null || im=convert
+    mean=$("$im" "$tmp" -colorspace Gray -format '%[fx:mean]' info: 2>/dev/null)
+    awk -v m="${mean:-1}" 'BEGIN { exit !(m < 0.5) }' && neg=(-negate)
+    "$im" "$tmp" -colorspace Gray "${neg[@]}" -resize 300% -sharpen 0x1 "$tmp"
+
+    text=$(tesseract "$tmp" stdout -l "$OCR_LANGS" --psm "$OCR_PSM" 2>/dev/null)
+    rm -f "$tmp"
+    if [[ -z ${text//[[:space:]]/} ]]; then
+        notify "No text found"
+        return
+    fi
+    printf '%s' "$text" | wl-copy
+    notify "Text copied" "$(head -c 120 <<<"$text")"
+}
+
+# Google image search (Lens) for a region. The browser does the upload: a
+# small local page holds the picture and sends it to Google as soon as it
+# opens, so the search runs in your normal browser session and nothing goes
+# through any other service. The region is also copied, to paste into the
+# search page if Google ever changes how uploads work.
+lens_region() {
+    local geom dir img page im
+    freeze_start
+    geom=$(pick_region) || exit 0
+    dir=${XDG_RUNTIME_DIR:-/tmp}/capture-lens
+    mkdir -p "$dir" && chmod 700 "$dir"
+    # Pages from earlier searches (only this folder, only our own files)
+    find "$dir" -maxdepth 1 -type f -name 'lens-*' -mmin +10 -delete 2>/dev/null
+    img="$dir/lens-$(stamp).png"
+    grim -g "$geom" "$img" || { freeze_stop; notify "Screenshot failed"; exit 1; }
+    freeze_stop
+    wl-copy --type image/png < "$img"
+
+    # Large regions upload faster as a smaller JPEG; Lens doesn't need more
+    im=magick; command -v magick >/dev/null || im=convert
+    if command -v "$im" >/dev/null && "$im" "$img" -resize '1600x1600>' -quality 90 "${img%.png}.jpg" 2>/dev/null; then
+        rm -f "$img"; img=${img%.png}.jpg
+    fi
+
+    page="${img%.*}.html"
+    {
+        cat <<'HTML'
+<!doctype html><meta charset="utf-8"><title>Searching…</title>
+<body style="background:#111;color:#ccc;font:16px sans-serif;display:grid;place-items:center;height:100vh;margin:0">
+<p>Sending the picture to Google…</p>
+<form id="f" method="post" enctype="multipart/form-data">
+<input type="file" name="encoded_image" id="i" hidden></form>
+<script>
+HTML
+        printf 'const url = %s + "&st=" + Date.now();
+' "\"$LENS_URL\""
+        printf 'const type = "%s", name = "%s";
+' \
+            "$([[ $img == *.jpg ]] && echo image/jpeg || echo image/png)" "$(basename "$img")"
+        printf 'const b64 = "'
+        base64 -w 0 "$img"
+        printf '";
+'
+        cat <<'HTML'
+const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+const dt = new DataTransfer();
+dt.items.add(new File([bytes], name, { type }));
+document.getElementById("i").files = dt.files;
+const f = document.getElementById("f");
+f.action = url;
+f.submit();
+</script>
+HTML
+    } > "$page"
+
+    if ! xdg-open "$page" >/dev/null 2>&1; then
+        notify "Couldn't open the browser" "The region is in the clipboard; paste it at lens.google.com"
+        return
+    fi
+    notify "Searching on Google" "Region also copied to the clipboard"
+}
+
+# Tell the Noctalia bar widget about recording state (no-op if not installed)
+indicator() {
+    [[ -n $REC_INDICATOR ]] || return 0
+    noctalia msg plugin "$REC_INDICATOR" all "$@" >/dev/null 2>&1 || true
+}
+
+# --- recording ----------------------------------------------------------------
+#
+# Recording uses gpu-screen-recorder, which encodes on the GPU. It records one
+# monitor at a time, so a recording that spans several monitors (a region
+# across them, or "all screens") is recorded as one part per monitor; when you
+# stop, the parts are joined into a single video with ffmpeg and then deleted.
+# Recordings on a single monitor are saved directly.
+#
+# The script remembers the process IDs of the recorders it started and only
+# ever stops those, so other gpu-screen-recorder uses (e.g. Noctalia's own
+# recorder or replay buffer) are left alone.
+
+REC_STATE="${XDG_RUNTIME_DIR:-/tmp}/capture-recording"   # holds "pids" and "job"
+
+# Options shared by every recorder
+gsr_common() {
+    GSR_COMMON=(-f "$REC_FPS" -cursor no)
+    (( SHOW_CURSOR )) && GSR_COMMON=(-f "$REC_FPS" -cursor yes)
+}
+
+# Is PID one of our recorders and still running? (An exited process can
+# linger briefly as a "zombie" with its name intact, so check its state too.)
+is_recorder() {
+    local stat comm
+    { stat=$(< "/proc/$1/stat"); comm=$(< "/proc/$1/comm"); } 2>/dev/null || return 1
+    [[ ${stat##*) } != Z* ]] || return 1
+    [[ $comm == gpu-screen-reco* ]]
+}
+
+# PIDs of our recorders that are still running
+live_recorders() {
+    local pid
+    [[ -f $REC_STATE/pids ]] || return 0
+    while read -r pid; do
+        [[ -n $pid ]] && is_recorder "$pid" && echo "$pid"
+    done < "$REC_STATE/pids"
+}
+
+recording_active() { [[ -n $(live_recorders) ]]; }
+
+# Start one recorder, detached from this script. Arguments go to
+# gpu-screen-recorder. The small sh wrapper writes its own PID to the state
+# file and then becomes the recorder, so the PID is the recorder's.
+# (Started via "setsid -f" rather than "&": programs started with "&" from a
+# script would inherit "ignore SIGINT", and SIGINT is how recording stops.)
+launch_recorder() {
+    mkdir -p "$REC_STATE"
+    setsid -f sh -c 'echo $$ >> "$0"; exec gpu-screen-recorder "$@"' \
+        "$REC_STATE/pids" "$@" >/dev/null 2>&1
+}
+
+# After launching, check that all recorders are still alive (bad arguments or
+# capture errors make them exit within a second)
+check_started() {
+    local want=$1
+    sleep 1.2
+    if (( $(live_recorders | wc -l) < want )); then
+        rec_stop quiet
+        notify "Recording failed to start" "Try: gpu-screen-recorder -w <monitor> -o /tmp/test.mp4 in a terminal"
+        exit 1
+    fi
+    indicator start "$(date +%s)"
+    notify "Recording started" "Press Print again to stop"
+}
+
+# Single-monitor recording. Arguments select what to capture (-w ...).
+rec_start() {
+    local file audio=()
+    file="$REC_DIR/$(stamp).mp4"
+    (( REC_AUDIO )) && audio=(-a default_output -ac aac)   # AAC: Messenger etc. reject Opus in .mp4
+    gsr_common
+    rm -f "$REC_STATE/pids" "$REC_STATE/job"
+    launch_recorder "$@" "${GSR_COMMON[@]}" "${audio[@]}" -o "$file"
+    check_started 1
+}
+
+# Split a region (global layout coordinates) into one piece per monitor it
+# touches. Prints one line per piece:
+#   OUTPUT X Y W H OFFSET_X OFFSET_Y FULL
+# X/Y/W/H: the piece in global coordinates; OFFSET: its position inside the
+# region; FULL: 1 if the piece is that whole monitor.
+plan_pieces() {
+    niri msg --json outputs | jq -r \
+        --argjson rx "$1" --argjson ry "$2" --argjson rw "$3" --argjson rh "$4" '
+        to_entries[]
+        | select(.value.logical != null)
+        | .key as $name | .value.logical as $l
+        | ([$rx, $l.x] | max) as $x1
+        | ([$ry, $l.y] | max) as $y1
+        | ([$rx + $rw, $l.x + $l.width]  | min) as $x2
+        | ([$ry + $rh, $l.y + $l.height] | min) as $y2
+        | select($x2 > $x1 and $y2 > $y1)
+        | [$name, $x1, $y1, ($x2 - $x1), ($y2 - $y1), ($x1 - $rx), ($y1 - $ry),
+           (if $x1 == $l.x and $y1 == $l.y and ($x2 - $x1) == $l.width
+               and ($y2 - $y1) == $l.height then 1 else 0 end)]
+        | map(tostring) | join(" ")'
+}
+
+# What to capture for one piece: a whole monitor, or a region of it.
+# Region sizes are rounded down to even numbers (video encoders need that).
+piece_target() {
+    local name=$1 x=$2 y=$3 w=$4 h=$5 full=$6
+    if (( full )); then
+        TARGET=(-w "$name")
+    else
+        TARGET=(-w region -region "$(( w - w % 2 ))x$(( h - h % 2 ))+$x+$y")
+    fi
+}
+
+# Record a region given as "X,Y WxH" (slurp format), across monitors if needed
+rec_geometry() {
+    local geom=$1 rx ry rw rh
+    read -r rx ry rw rh < <(sed -E 's/^([-0-9]+),([-0-9]+) ([0-9]+)x([0-9]+)$/\1 \2 \3 \4/' <<<"$geom")
+    [[ $rw =~ ^[0-9]+$ && $rh =~ ^[0-9]+$ ]] || { notify "Bad selection: $geom"; exit 1; }
+
+    local pieces=()
+    mapfile -t pieces < <(plan_pieces "$rx" "$ry" "$rw" "$rh")
+    (( ${#pieces[@]} > 0 )) || { notify "Selection is not on any screen"; exit 1; }
+
+    local name x y w h ox oy full
+    if (( ${#pieces[@]} == 1 )); then
+        read -r name x y w h ox oy full <<<"${pieces[0]}"
+        piece_target "$name" "$x" "$y" "$w" "$h" "$full"
+        rec_start "${TARGET[@]}"
+        return
+    fi
+
+    # Several monitors: one part per monitor, joined when recording stops
+    local job i=0 audio=()
+    job="$REC_DIR/.capture-$(stamp)"
+    mkdir -p "$job"
+    gsr_common
+    rm -f "$REC_STATE/pids" "$REC_STATE/job"
+    printf '%s %s %s\n' "$(( rw - rw % 2 ))" "$(( rh - rh % 2 ))" \
+        "$REC_DIR/$(basename "$job" | sed 's/^\.capture-//').mp4" > "$job/layout"
+
+    for line in "${pieces[@]}"; do
+        read -r name x y w h ox oy full <<<"$line"
+        piece_target "$name" "$x" "$y" "$w" "$h" "$full"
+        audio=()
+        (( i == 0 && REC_AUDIO )) && audio=(-a default_output)   # sound in the first part
+        (( full )) || { w=$(( w - w % 2 )); h=$(( h - h % 2 )); }
+        echo "part$i.mkv $ox $oy $w $h" >> "$job/layout"
+        launch_recorder "${TARGET[@]}" "${GSR_COMMON[@]}" "${audio[@]}" -o "$job/part$i.mkv"
+        i=$(( i + 1 ))
+    done
+
+    echo "$job" > "$REC_STATE/job"
+    check_started "$i"
+}
+
+rec_region() {
+    local geom
+    geom=$(pick_region) || exit 0
+    rec_geometry "$geom"
+}
+
+rec_screen_pick() {
+    local out
+    out=$(pick_output) || exit 0
+    [[ -n $out ]] || exit 0
+    rec_start -w "$out"
+}
+
+rec_screen_focused() {
+    rec_start -w "$(focused_output)"
+}
+
+# Everything: the bounding box of all enabled monitors
+rec_all() {
+    local geom
+    geom=$(niri msg --json outputs | jq -r '
+        [.[] | .logical | select(. != null)] as $o
+        | ($o | map(.x) | min) as $x | ($o | map(.y) | min) as $y
+        | ($o | map(.x + .width)  | max) as $x2
+        | ($o | map(.y + .height) | max) as $y2
+        | "\($x),\($y) \($x2 - $x)x\($y2 - $y)"')
+    rec_geometry "$geom"
+}
+
+# Stop our recorders. With "quiet": no notifications, no joining (used when
+# starting failed).
+rec_stop() {
+    local quiet=${1:-} pids pid i job=""
+    pids=$(live_recorders)
+    [[ -f $REC_STATE/job ]] && job=$(< "$REC_STATE/job")
+    rm -f "$REC_STATE/pids" "$REC_STATE/job"
+    # The bar shows "Processing" while a multi-screen recording is joined
+    if [[ -n $job && -n $pids && $quiet != quiet ]]; then
+        indicator processing
+    else
+        indicator stop
+    fi
+    [[ -n $pids ]] || return 0
+
+    for pid in $pids; do kill -INT "$pid" 2>/dev/null; done
+    # gpu-screen-recorder finishes writing the file after SIGINT; wait for it
+    for (( i = 0; i < 150; i++ )); do
+        local alive=0
+        for pid in $pids; do is_recorder "$pid" && alive=1; done
+        (( alive )) || break
+        sleep 0.1
+    done
+    [[ $quiet == quiet ]] && return 0
+
+    if [[ -n $job ]]; then
+        setsid -f "$0" _join "$job" >/dev/null 2>&1
+    else
+        notify "Recording saved" "$REC_DIR"
+    fi
+}
+
+# Notification that stays until processing ends, updated in place with the
+# progress, then replaced by the result. PROG_ID is the notification's id.
+PROG_ID=""
+progress_note() {           # TITLE BODY [PERCENT]
+    local hint=() id
+    [[ -n ${3:-} ]] && hint=(-h "int:value:$3")
+    id=$(notify-send -a capture -t 0 -p ${PROG_ID:+-r "$PROG_ID"} "${hint[@]}" "$1" "$2" 2>/dev/null)
+    [[ $id =~ ^[0-9]+$ ]] && PROG_ID=$id
+}
+progress_done() {           # TITLE BODY
+    notify-send -a capture -t 5000 ${PROG_ID:+-r "$PROG_ID"} "$1" "$2" 2>/dev/null
+}
+
+# Join a multi-monitor recording into one video (runs in the background)
+rec_join() {
+    local job=$1 W H final
+    [[ -f $job/layout ]] || { indicator stop; notify "Recording parts not found" "$job"; exit 1; }
+    { read -r W H final; mapfile -t parts; } < "$job/layout"
+    local what="Joining ${#parts[@]} screens"
+
+    progress_note "Processing recording…" "$what"
+
+    local args=(-hide_banner -loglevel error -y) filter i=0 n file ox oy w h
+    filter="color=c=black:s=${W}x${H}:r=${REC_FPS}[b0];"
+    for line in "${parts[@]}"; do
+        read -r file ox oy w h <<<"$line"
+        args+=(-i "$job/$file")
+        filter+="[$i:v]scale=${w}:${h},setpts=PTS-STARTPTS[v$i];"
+        filter+="[b$i][v$i]overlay=${ox}:${oy}:shortest=1[b$(( i + 1 ))];"
+        i=$(( i + 1 ))
+    done
+    n=$i
+    filter=${filter%;}
+
+    # Total length, for the percentage (from the first part)
+    local dur
+    dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$job/part0.mkv" 2>/dev/null)
+    [[ $dur =~ ^[0-9.]+$ ]] || dur=""
+
+    # Encode on the GPU (NVENC) if ffmpeg has it, otherwise on the CPU
+    local encoders=() enc ok=0
+    ffmpeg -hide_banner -encoders 2>/dev/null | grep -q h264_nvenc && encoders+=(nvenc)
+    encoders+=(x264)
+    for enc in "${encoders[@]}"; do
+        local venc fpid pct us
+        case $enc in
+            nvenc) venc=(-c:v h264_nvenc -preset p5 -rc vbr -cq 20 -b:v 0) ;;
+            x264)  venc=(-c:v libx264 -preset veryfast -crf 20) ;;
+        esac
+        rm -f "$job/progress"
+        ffmpeg "${args[@]}" -filter_complex "$filter" \
+            -map "[b$n]" -map '0:a?' \
+            "${venc[@]}" -pix_fmt yuv420p \
+            -c:a aac -b:a 192k -movflags +faststart \
+            -progress "$job/progress" -nostats \
+            "$final" 2>>"$job/ffmpeg.log" &
+        fpid=$!
+
+        # Update the notification every 2 s while ffmpeg runs
+        while kill -0 "$fpid" 2>/dev/null; do
+            sleep 2
+            [[ -n $dur && -f $job/progress ]] || continue
+            us=$(grep '^out_time_us=' "$job/progress" | tail -n1 | cut -d= -f2)
+            [[ $us =~ ^[0-9]+$ ]] || continue
+            pct=$(awk -v u="$us" -v d="$dur" 'BEGIN { p = int(u / (d * 10000)); print (p > 99 ? 99 : p) }')
+            progress_note "Processing recording…" "$what — $pct%" "$pct"
+        done
+
+        if wait "$fpid"; then
+            ok=1
+            break
+        fi
+    done
+
+    # Clear the bar indicator, unless a new recording started meanwhile
+    recording_active || indicator stop
+
+    if (( ok )); then
+        rm -rf -- "$job"
+        progress_done "Recording saved" "$(basename "$final")"
+    else
+        rm -f -- "$final"
+        progress_done "Joining the recording failed" "Parts kept in $job (see ffmpeg.log)"
+    fi
+}
+
+run_mode() {
+    # Only screenshots use the frozen image. Window picking and recording need
+    # the live screen, so unfreeze first (matters when coming from the menu).
+    case $1 in
+        region|edit|screen|screen-focused|all|ocr|lens) ;;
+        *) freeze_stop ;;
+    esac
+
+    case $1 in
+        region)             shot_region ;;
+        edit)               shot_edit ;;
+        window)             shot_window_pick ;;
+        window-focused)     shot_window_focused ;;
+        window-niri)        shot_window_pick_niri ;;
+        window-focused-niri) shot_window_focused_niri ;;
+        screen)             shot_screen_pick ;;
+        screen-focused)     shot_screen_focused ;;
+        all)                shot_all ;;
+        ocr)                ocr_region ;;
+        lens)               lens_region ;;
+        rec-region)         rec_region ;;
+        rec-screen)         rec_screen_pick ;;
+        rec-screen-focused) rec_screen_focused ;;
+        rec-all)            rec_all ;;
+        stop)               rec_stop ;;
+        _join)              rec_join "${2:-}" ;;
+        menu)               menu ;;
+        *)                  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    esac
+}
+
+menu() {
+    local entry idx
+    (( FREEZE_MENU )) && freeze_start   # freeze the moment the menu opens
+    # --index returns the chosen line's position, so identical labels work
+    idx=$(for entry in "${MENU[@]}"; do echo "${entry%%|*}"; done |
+        fuzzel --dmenu --index --layer overlay --prompt "Capture: " --lines "${#MENU[@]}") || exit 0
+    [[ $idx =~ ^[0-9]+$ ]] && (( idx < ${#MENU[@]} )) || exit 0
+    entry=${MENU[$idx]}
+    run_mode "${entry#*|}"
+}
+
+# Any call while recording stops the recording.
+if recording_active; then
+    rec_stop
+    exit 0
+fi
+
+run_mode "${1:-region}" "${@:2}"

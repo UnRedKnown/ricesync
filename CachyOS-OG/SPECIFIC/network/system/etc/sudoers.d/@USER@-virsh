@@ -1,0 +1,3 @@
+@USER@ ALL=(ALL) NOPASSWD: /usr/bin/virsh
+@USER@ ALL=(ALL) NOPASSWD: /usr/bin/systemctl start libvirtd
+@USER@ ALL=(ALL) NOPASSWD: /usr/bin/systemctl start virtlogd

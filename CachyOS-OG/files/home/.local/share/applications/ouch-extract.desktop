@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Extract here (ouch)
+Comment=Extract archives next to themselves
+Exec=kitty --class unpack --title "Extracting…" -e unpack %F
+Icon=package-x-generic
+Terminal=false
+NoDisplay=true
+MimeType=application/zip;application/x-zip-compressed;application/x-7z-compressed;application/x-tar;application/x-compressed-tar;application/x-bzip2-compressed-tar;application/x-bzip3-compressed-tar;application/x-xz-compressed-tar;application/x-zstd-compressed-tar;application/x-lz4-compressed-tar;application/x-lzma-compressed-tar;application/gzip;application/x-gzip;application/x-bzip2;application/x-bzip3;application/x-xz;application/zstd;application/x-zstd;application/x-lz4;application/x-lzma;application/vnd.rar;application/x-rar;application/x-rar-compressed;application/x-snappy-framed;
