@@ -69,6 +69,8 @@ S/usr/local/bin/winfo
 S/usr/local/bin/yazi-filechooser
 S/usr/local/bin/yazi-filemanager1
 S/usr/local/bin/unpack
+S/usr/local/bin/glass
+S/usr/local/bin/killwin
 
 # ---- system ------------------------------------------------------------------
 S/etc/greetd/config.toml
@@ -83,12 +85,16 @@ X~/.config/gtk-3.0/gtk.css
 X~/.config/gtk-4.0/gtk.css
 X~/.config/gtk-3.0/thunar.css
 X~/.config/gtk-4.0/thunar.css
+S~/.config/gtk-4.0/custom.css
 X~/.config/gtk-3.0/assets/
 X~/.config/kdeglobals
 X~/.config/noctalia/colors.json
 X~/.config/niri/noctalia.kdl
 X~/.config/umbriel/noctalia.toml
 X~/.config/plasma-org.kde.plasma.desktop-appletsrc
+S~/.local/share/Steam/millennium/themes/Vitrine/
+X~/.local/share/Steam/millennium/themes/Vitrine/background.css
+X~/.local/share/Steam/millennium/themes/Vitrine/css/main/colors/matugen.css
 
 # ---- changed from dotsync ----
 X~/.config/input-remapper-2/config.json
