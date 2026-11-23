@@ -30,3 +30,8 @@ my machines and to rebuild on any new ones.
 - Try `./install.sh --dry-run` first to check what will be changed.
 - Expect bugs, rough edges and assumptions that only hold for my hardware.
 - No support or warranty. Use at your own risk.
+
+## All programs and files belong to their respective owners
+
+I do not claim ownership of any copyrighted files within this repo.
+Things like fonts, programs, ELF binaries are simply repackaged here for ease of use.
