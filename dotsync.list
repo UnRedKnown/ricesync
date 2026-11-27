@@ -113,3 +113,4 @@ S/usr/local/bin/sedit
 S~/.config/userscripts/
 X~/.config/fontconfig/fonts.conf.bak
 X~/.local/share/fonts/MapleMono/.uuid
+S/etc/security/faillock.conf
